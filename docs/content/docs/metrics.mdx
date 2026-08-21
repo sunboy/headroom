@@ -152,6 +152,18 @@ Read them together: a high `lossy_unrecoverable` rate with a correspondingly hig
 `headroom.ccr.operations{outcome="hit"}` rate on the *same* strategy is the
 strongest signal that a given compressor is too aggressive for your traffic.
 
+`headroom.compression.events` also covers tool-schema and tool-description
+compaction, which run outside the main compression pipeline and use a fixed
+`lossy` label per layer rather than a per-event marker check: reformatting a
+tool's JSON schema is always `lossless` (`anthropic:tool_schema_compaction`,
+`openai:responses:tool_schema_compaction`, `openai:chat:tool_schema_compaction`),
+while truncating a tool's description text is always `lossy_unrecoverable`
+(`anthropic:tool_desc_compaction`, `openai:responses:tool_desc_compaction`,
+`openai:chat:tool_desc_compaction`) — there's no CCR marker to recover the
+truncated text. System-prompt compaction isn't in this list: it routes through
+the same `ContentRouter` as message compression, so it's already reported
+under whichever strategy it picked, not a separate label.
+
 ### Dynatrace
 
 Point the exporter at your environment's OTLP API and add the API token as a header. The token needs the `metrics.ingest` scope.

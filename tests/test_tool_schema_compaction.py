@@ -9,9 +9,16 @@ Verifies that the compaction logic (shared by OpenAI and Anthropic handlers):
 
 from __future__ import annotations
 
+import pytest
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
 from headroom.proxy.tool_schema_compaction import (
+    _COMPACTION_LOSSY,
     compact_tool_schema_value,
     compact_tools,
+    record_compaction_event,
 )
 
 # ---------------------------------------------------------------------------
@@ -469,3 +476,84 @@ class TestCompactToolDescriptions:
         assert modified is True
         savings_pct = (1 - after / before) * 100
         assert savings_pct >= 10, f"Expected ≥10% savings, got {savings_pct:.1f}%"
+
+
+# ---------------------------------------------------------------------------
+# record_compaction_event — OTEL telemetry
+# ---------------------------------------------------------------------------
+
+
+def _collect_metrics(reader: InMemoryMetricReader) -> dict[str, object]:
+    data = reader.get_metrics_data()
+    collected: dict[str, object] = {}
+    for resource_metric in data.resource_metrics:
+        for scope_metric in resource_metric.scope_metrics:
+            for metric in scope_metric.metrics:
+                collected[metric.name] = metric
+    return collected
+
+
+def _find_point(metric, **expected_attributes):
+    for point in metric.data.data_points:
+        if all(point.attributes.get(key) == value for key, value in expected_attributes.items()):
+            return point
+    raise AssertionError(f"No datapoint matched attributes: {expected_attributes}")
+
+
+class TestRecordCompactionEvent:
+    """`_COMPACTION_LOSSY` is a fixed classification (not per-event, unlike
+    `classify_lossy`), since schema/desc compaction's recoverability is a
+    structural property of what each layer does. All six real strategy
+    labels must be present, and an unknown one must fail loud rather than
+    silently default."""
+
+    def setup_method(self) -> None:
+        self.reader = InMemoryMetricReader()
+        provider = MeterProvider(metric_readers=[self.reader])
+        set_otel_metrics(HeadroomOtelMetrics(meter_provider=provider))
+
+    def teardown_method(self) -> None:
+        reset_otel_metrics()
+
+    def test_all_six_real_strategy_labels_are_classified(self) -> None:
+        assert set(_COMPACTION_LOSSY) == {
+            "anthropic:tool_schema_compaction",
+            "anthropic:tool_desc_compaction",
+            "openai:responses:tool_schema_compaction",
+            "openai:responses:tool_desc_compaction",
+            "openai:chat:tool_schema_compaction",
+            "openai:chat:tool_desc_compaction",
+        }
+        # Schema compaction is a structural reformat (semantics unchanged);
+        # description truncation drops content with no CCR marker involved.
+        for strategy, lossy in _COMPACTION_LOSSY.items():
+            expected = (
+                "lossless"
+                if strategy.endswith("tool_schema_compaction")
+                else ("lossy_unrecoverable")
+            )
+            assert lossy == expected, strategy
+
+    def test_unknown_strategy_raises_rather_than_silently_defaulting(self) -> None:
+        with pytest.raises(KeyError):
+            record_compaction_event(
+                "not_a_real_strategy", original_tokens=100, compressed_tokens=50
+            )
+
+    def test_records_the_fixed_lossy_pair_and_token_counts(self) -> None:
+        record_compaction_event(
+            "anthropic:tool_desc_compaction", original_tokens=100, compressed_tokens=40
+        )
+
+        metrics = _collect_metrics(self.reader)
+        events = metrics["headroom.compression.events"]
+        point = _find_point(
+            events, strategy="anthropic:tool_desc_compaction", lossy="lossy_unrecoverable"
+        )
+        assert point.value == 1
+
+        saved = metrics["headroom.compression.events.tokens.saved"]
+        saved_point = _find_point(
+            saved, strategy="anthropic:tool_desc_compaction", lossy="lossy_unrecoverable"
+        )
+        assert saved_point.value == 60

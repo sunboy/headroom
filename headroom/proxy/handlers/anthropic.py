@@ -55,6 +55,7 @@ from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.tool_schema_compaction import record_compaction_event
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -2779,6 +2780,11 @@ class AnthropicHandlerMixin:
                     transforms_applied.append("anthropic:tool_schema_compaction")
                     _tool_tokens_before = _count_tool_tokens(_pre_compaction_tools)
                     _tool_tokens_after = _count_tool_tokens(tools)
+                    record_compaction_event(
+                        "anthropic:tool_schema_compaction",
+                        original_tokens=_tool_tokens_before,
+                        compressed_tokens=_tool_tokens_after,
+                    )
                     _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
                     logger.debug(
                         "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
@@ -2812,6 +2818,15 @@ class AnthropicHandlerMixin:
                     if _desc_modified:
                         tools = body["tools"]
                         transforms_applied.append("anthropic:tool_desc_compaction")
+                        # Layer-local counts for telemetry: _tool_tokens_before/after
+                        # below are cumulative across both layers (only seeded once),
+                        # so a desc-only pair is computed fresh here, independent of
+                        # whether schema compaction also fired first.
+                        record_compaction_event(
+                            "anthropic:tool_desc_compaction",
+                            original_tokens=_count_tool_tokens(_pre_desc_tools),
+                            compressed_tokens=_count_tool_tokens(tools),
+                        )
                         # Runs after schema compaction, so only seed "before" when that
                         # pass didn't already; "after" always tracks the latest tools.
                         if not _tool_tokens_before:

@@ -124,3 +124,30 @@ def test_chat_handler_calls_the_desc_pass(monkeypatch):
     # The Anthropic and Responses handlers already had their own labels; make sure
     # the chat one is distinct so `headroom perf --by-transform` can attribute it.
     assert "openai:responses:tool_desc_compaction" in source
+
+
+def test_chat_and_responses_handlers_report_compaction_telemetry():
+    """Guard the OTEL wiring the same way: schema and desc compaction on both
+    the Chat Completions and Responses paths must each call
+    `record_compaction_event` with their own real strategy label — same
+    source-level check as `test_chat_handler_calls_the_desc_pass` above,
+    since driving either handler live needs a real upstream.
+    """
+    import inspect
+
+    from headroom.proxy.handlers import openai as openai_handler
+
+    source = inspect.getsource(openai_handler)
+    for label in (
+        "openai:chat:tool_schema_compaction",
+        "openai:chat:tool_desc_compaction",
+        "openai:responses:tool_schema_compaction",
+        "openai:responses:tool_desc_compaction",
+    ):
+        # Every label must be shortly followed by a record_compaction_event
+        # call — not just present anywhere in the file.
+        idx = source.index(f'"{label}"')
+        window = source[idx : idx + 800]
+        assert "record_compaction_event(" in window, (
+            f"expected record_compaction_event(...) shortly after {label!r}"
+        )

@@ -92,6 +92,7 @@ from headroom.proxy.project_context import (
     set_current_project,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.proxy.tool_schema_compaction import record_compaction_event
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -2549,10 +2550,17 @@ class OpenAIHandlerMixin:
             try:
                 tool_token_started = time.perf_counter()
                 tokenizer = self.openai_provider.get_token_counter(model)
-                tokens_saved += max(
-                    0,
-                    tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
-                    - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
+                # Layer-local: schema compaction is the first layer, so
+                # `payload` (pre-any-compaction) is already the correct "before".
+                _schema_tokens_before = tokenizer.count_text(
+                    _json_debug_dumps(payload.get("tools"))
+                )
+                _schema_tokens_after = tokenizer.count_text(_json_debug_dumps(working.get("tools")))
+                tokens_saved += max(0, _schema_tokens_before - _schema_tokens_after)
+                record_compaction_event(
+                    "openai:responses:tool_schema_compaction",
+                    original_tokens=_schema_tokens_before,
+                    compressed_tokens=_schema_tokens_after,
                 )
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
             except Exception:
@@ -2579,6 +2587,7 @@ class OpenAIHandlerMixin:
 
             _desc_max = tool_desc_max_chars()
             if _desc_max > 0:
+                _pre_desc_working = working
                 _desc_compact_started = time.perf_counter()
                 desc_payload, desc_modified, desc_before, desc_after = compact_tool_descriptions(
                     working, _desc_max
@@ -2594,6 +2603,18 @@ class OpenAIHandlerMixin:
                             0,
                             tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
                             - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
+                        )
+                        # Layer-local (not the cumulative delta above, which spans
+                        # schema+desc combined if schema also fired): diff against
+                        # the tools state immediately before this desc call.
+                        record_compaction_event(
+                            "openai:responses:tool_desc_compaction",
+                            original_tokens=tokenizer.count_text(
+                                _json_debug_dumps(_pre_desc_working.get("tools"))
+                            ),
+                            compressed_tokens=tokenizer.count_text(
+                                _json_debug_dumps(working.get("tools"))
+                            ),
                         )
                     except Exception:
                         pass
@@ -3850,6 +3871,11 @@ class OpenAIHandlerMixin:
                     tools = compacted_tool_payload["tools"]
                     if "openai:chat:tool_schema_compaction" not in transforms_applied:
                         transforms_applied.append("openai:chat:tool_schema_compaction")
+                    record_compaction_event(
+                        "openai:chat:tool_schema_compaction",
+                        original_tokens=tool_tokens_before_compaction,
+                        compressed_tokens=tokenizer.count_text(_json_debug_dumps(tools)),
+                    )
             except Exception as e:
                 logger.debug(f"[{request_id}] tool schema compaction failed: {e}")
 
@@ -3869,6 +3895,7 @@ class OpenAIHandlerMixin:
 
                 _desc_max = tool_desc_max_chars()
                 if _desc_max > 0:
+                    _pre_desc_tools = tools
                     _desc_payload, _desc_modified, _desc_before, _desc_after = (
                         compact_tool_descriptions({"tools": tools}, _desc_max)
                     )
@@ -3881,6 +3908,17 @@ class OpenAIHandlerMixin:
                             )
                         tools = _desc_payload["tools"]
                         transforms_applied.append("openai:chat:tool_desc_compaction")
+                        # Layer-local (not the cumulative tool_tokens_before_compaction
+                        # above, which spans schema+desc combined if schema also
+                        # fired): diff against the tools state immediately before
+                        # this desc call.
+                        record_compaction_event(
+                            "openai:chat:tool_desc_compaction",
+                            original_tokens=tokenizer.count_text(
+                                _json_debug_dumps(_pre_desc_tools)
+                            ),
+                            compressed_tokens=tokenizer.count_text(_json_debug_dumps(tools)),
+                        )
                         logger.debug(
                             "[%s] tool description compaction: %d -> %d bytes "
                             "(%.0f%% saved, max_chars=%d)",

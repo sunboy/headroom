@@ -414,3 +414,45 @@ def compact_tool_descriptions(
     updated = copy.deepcopy(payload)
     updated["tools"] = compacted_tools
     return updated, True, before, after
+
+
+# ─── Compaction telemetry ──────────────────────────────────────────────
+#
+# Schema and description compaction run entirely outside the
+# ContentRouter/SmartCrusher observer machinery (`headroom.transforms.
+# observability.classify_lossy`), so they need their own lossy
+# classification. Unlike that per-event marker check, recoverability
+# here is a structural property of what each layer does, not of what it
+# happened to compress this time: schema compaction only strips
+# annotation keys (semantics unchanged), description truncation is pure
+# text truncation with no CCR marker machinery involved at all. Fixed,
+# not computed per-event — a single source of truth so the six call
+# sites (Anthropic + OpenAI Responses + OpenAI Chat, x2 layers each)
+# don't each repeat the classification.
+_COMPACTION_LOSSY: dict[str, str] = {
+    "anthropic:tool_schema_compaction": "lossless",
+    "anthropic:tool_desc_compaction": "lossy_unrecoverable",
+    "openai:responses:tool_schema_compaction": "lossless",
+    "openai:responses:tool_desc_compaction": "lossy_unrecoverable",
+    "openai:chat:tool_schema_compaction": "lossless",
+    "openai:chat:tool_desc_compaction": "lossy_unrecoverable",
+}
+
+
+def record_compaction_event(strategy: str, *, original_tokens: int, compressed_tokens: int) -> None:
+    """Record one tool-schema/tool-desc compaction event through OTEL.
+
+    ``strategy`` must be one of the exact `transforms_applied` labels
+    already used at each call site (e.g. ``"anthropic:tool_desc_compaction"``)
+    — reusing that string keeps this dict as the single source of truth
+    for a compaction layer's fixed lossy classification.
+    """
+    from headroom.observability import get_otel_metrics
+
+    lossy = _COMPACTION_LOSSY[strategy]
+    get_otel_metrics().record_compression_event(
+        strategy=strategy,
+        lossy=lossy,
+        original_tokens=original_tokens,
+        compressed_tokens=compressed_tokens,
+    )

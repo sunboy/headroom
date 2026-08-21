@@ -318,3 +318,89 @@ class TestAnthropicHandlerReportsL1Transform:
         assert "anthropic:tool_schema_compaction" in transforms_header, (
             f"expected L1 label in x-headroom-transforms, got: {transforms_header!r}"
         )
+
+
+class TestAnthropicHandlerReportsCompactionTelemetry:
+    """End-to-end: L1 (schema) and L2 (desc) compaction must each report
+    through `headroom.compression.events`, not just `transforms_applied` —
+    with layer-local token counts, not the cumulative `_tool_tokens_before/
+    after` pair (which only seeds "before" once across both layers)."""
+
+    def test_l1_and_l2_report_layer_local_compression_events(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        import headroom.proxy.tool_schema_compaction as tsc
+
+        monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "20")
+        tsc._TOOL_DESC_MAX_CHARS = None
+
+        calls: list[tuple[str, str, int, int]] = []
+
+        class _SpyOtelMetrics:
+            def record_compression_event(
+                self, *, strategy, lossy, original_tokens, compressed_tokens
+            ):
+                calls.append((strategy, lossy, original_tokens, compressed_tokens))
+
+        monkeypatch.setattr("headroom.observability.get_otel_metrics", lambda: _SpyOtelMetrics())
+
+        with _make_proxy_client() as client:
+            proxy = client.app.state.proxy
+
+            def _fake_apply(**kwargs):
+                return SimpleNamespace(
+                    messages=kwargs["messages"],
+                    transforms_applied=[],
+                    timing={},
+                    tokens_before=10,
+                    tokens_after=10,
+                    waste_signals=None,
+                )
+
+            proxy.anthropic_pipeline.apply = _fake_apply
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                return _ok_response("msg_compaction_telemetry")
+
+            proxy._retry_request = _fake_retry
+
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [
+                        {
+                            "name": "read_file",
+                            "description": "Read a file from disk.  Returns text content "
+                            "with extra detail well past twenty characters.",
+                            "input_schema": {
+                                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                                "title": "read_file_schema",
+                                "examples": [{"path": "/tmp/test.txt"}],
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                            },
+                        }
+                    ],
+                },
+            )
+
+        tsc._TOOL_DESC_MAX_CHARS = None
+        assert response.status_code == 200, response.text
+
+        by_strategy = {c[0]: c for c in calls}
+        assert "anthropic:tool_schema_compaction" in by_strategy
+        schema_call = by_strategy["anthropic:tool_schema_compaction"]
+        assert schema_call[1] == "lossless"
+        assert schema_call[2] > schema_call[3]  # real reduction
+
+        assert "anthropic:tool_desc_compaction" in by_strategy
+        desc_call = by_strategy["anthropic:tool_desc_compaction"]
+        assert desc_call[1] == "lossy_unrecoverable"
+        assert desc_call[2] > desc_call[3]  # real reduction, layer-local
