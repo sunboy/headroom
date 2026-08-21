@@ -1,0 +1,68 @@
+---
+title: Auth Modes (Automatic Compression Aggressiveness)
+description: Headroom classifies every request into one of three auth modes from its headers alone and automatically adjusts compression aggressiveness — no configuration required.
+---
+
+Headroom's answer to "does it pick compression settings automatically?" is the **auth-mode
+classifier**. Every inbound proxy request is classified into one of three modes purely from its
+HTTP headers — no config, no flag, no per-user setup — and that classification changes how
+aggressively Headroom compresses and how it treats the provider's prompt cache.
+
+<Callout type="info" title="Zero configuration">
+  This runs on every request by default. You don't opt in, and there's nothing to tune unless you
+  want to override it (see [Overriding it](#overriding-it) below).
+</Callout>
+
+## The three modes
+
+| Mode | Typical caller | Signal |
+|---|---|---|
+| `payg` | Direct API key usage | `x-api-key`, `x-goog-api-key`, or `Authorization: Bearer sk-...` (not `sk-ant-oat-`) |
+| `oauth` | Claude Pro/Max OAuth, Codex/Cursor/Copilot OAuth, Bedrock SigV4 | `Authorization: Bearer sk-ant-oat-...`, a 3-segment JWT, or any non-Bearer `Authorization` scheme |
+| `subscription` | Claude Code, Claude CLI, Codex CLI, Cursor, Claude VS Code, GitHub Copilot, Anthropic CLI, Antigravity, Grok | User-Agent prefix match (`claude-code/`, `codex-cli/`, `cursor/`, etc.) |
+
+Detection runs in this order, and the **first** match wins — a subscription CLI carrying an OAuth
+token is still classified `subscription`, not `oauth`, because the User-Agent check runs first:
+
+1. User-Agent matches a known subscription-CLI prefix → `subscription`.
+2. `Authorization: Bearer sk-ant-oat-...` → `oauth`.
+3. `Authorization: Bearer sk-ant-api...` or `Bearer sk-...` → `payg`.
+4. `Authorization: Bearer <jwt>` (3 dot-separated segments) → `oauth`.
+5. Any other `Authorization` scheme (e.g. AWS SigV4 for Bedrock) → `oauth`.
+6. `x-api-key` or `x-goog-api-key` present → `payg`.
+7. No signal matched → `payg` (the safe default: misclassifying a non-PAYG caller as PAYG just
+   over-compresses, which costs a re-run — under-compressing a PAYG caller leaves money on the
+   table).
+
+## What actually changes
+
+`payg` and `oauth` currently get identical treatment; `subscription` is the conservative one:
+
+| Behavior | `payg` / `oauth` | `subscription` |
+|---|---|---|
+| Compression scope | Can rewrite the whole message list | **Live-zone only** — only the newest, not-yet-cached turn is touched; already-cached history is left byte-for-byte alone |
+| CacheAligner (dynamic-content extraction from the system prompt) | Enabled | **Disabled** — CacheAligner rewrites can themselves bust a prefix cache, which matters more than a marginal token saving for a caller making many requests per session |
+| Cross-user pattern learning (TOIN) | Reads and writes new patterns | **Read-only** — serves existing learned patterns but doesn't contribute new ones from this request |
+
+The reasoning: a `payg`/`oauth` caller is billed per token, so aggressive compression directly
+saves them money. A `subscription` CLI (Claude Code, Cursor, etc.) is rate-limited by request
+count under a flat subscription, not billed per token — so the bigger lever for it is *provider
+prompt-cache stability* across the many requests a coding session makes, not squeezing out a few
+more percent of token reduction at the cost of invalidating that cache.
+
+## Overriding it
+
+The classifier is on by default. To force the `payg`-equivalent policy regardless of how a
+request classifies (e.g. while debugging), set:
+
+```bash
+HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT=off headroom proxy
+```
+
+## See also
+
+- [Savings Profiles](/docs/proxy#savings-profiles) — a separate, explicitly-chosen posture
+  (`coding` / `balanced` / `agent-90` / `general`) layered on top of whichever auth mode a
+  request classifies as.
+- [Cache Optimization](/docs/cache-optimization) — how Headroom aligns with each provider's
+  prompt-cache mechanics in more detail.

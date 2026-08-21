@@ -45,6 +45,7 @@
     "mcp",
     "---Configuration---",
     "configuration",
+    "auth-modes",
     "codex-recovery",
     "pipeline-extensions",
     "filesystem-contract",

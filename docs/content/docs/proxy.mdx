@@ -100,7 +100,7 @@ headroom proxy --mode cache
 | `agent-90` | ~90% | `token` | Aggressive; pins a `0.10` keep-ratio and forces Kompress. |
 | `general` | emergent (~60%) | `token` | Non-coding workloads. |
 
-An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `balanced` — the proxy never fails to start over a bad profile name. See `headroom/agent_savings.py` for each profile's full set of knobs.
+An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `coding` (the same out-of-box default an unset variable resolves to) — the proxy never fails to start over a bad profile name. `balanced` is only used as a last resort if `coding` itself is unavailable (version skew against an older runtime). See `headroom/agent_savings.py` for each profile's full set of knobs.
 
 Because the default `coding` profile uses **cache** mode (and the proxy's own default mode is also `cache`), Headroom runs in cache mode out of the box. Mode precedence: an explicit `--mode` wins, otherwise `HEADROOM_MODE` (which a profile seeds), otherwise the `cache` default. To run token mode, pass `--mode token` or choose a token-mode profile:
 

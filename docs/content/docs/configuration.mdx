@@ -33,6 +33,11 @@ These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-req
 
 > **Proxy `--mode` is a separate axis**: `headroom proxy --mode token` (maximize compression) or `--mode cache` (freeze prior turns for prefix-cache stability). The proxy does not accept `audit`, `optimize`, or `simulate`.
 
+Two more axes worth knowing about: [Savings Profiles](/docs/proxy#savings-profiles) are an
+explicitly-chosen posture (`coding` / `balanced` / `agent-90` / `general`), while
+[Auth Modes](/docs/auth-modes) are classified automatically per-request from headers alone — no
+configuration needed unless you want to override the default.
+
 ## SDK Configuration
 
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
