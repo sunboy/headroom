@@ -28,6 +28,7 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import build_copilot_upstream_url
+from headroom.observability import get_otel_metrics
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
@@ -2487,6 +2488,9 @@ class AnthropicHandlerMixin:
                                     f"[{request_id}] CCR: skipping proactive expansion append "
                                     "in cache mode to preserve next-turn prefix stability"
                                 )
+                                get_otel_metrics().record_ccr_expansion(
+                                    delivered=False, item_count=len(expansions)
+                                )
                             else:
                                 optimized_messages = (
                                     self._append_context_to_latest_non_frozen_user_turn(
@@ -2494,6 +2498,9 @@ class AnthropicHandlerMixin:
                                         expansion_text,
                                         frozen_message_count=frozen_message_count,
                                     )
+                                )
+                                get_otel_metrics().record_ccr_expansion(
+                                    delivered=True, item_count=len(expansions)
                                 )
 
             # Traffic Learner: Extract patterns from inbound tool results

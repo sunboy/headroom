@@ -372,6 +372,30 @@ class HeadroomOtelMetrics:
             description="CCR store/retrieve operation duration.",
             unit="s",
         )
+        self._ccr_expansion_items = self._meter.create_counter(
+            "headroom.ccr.expansion.items",
+            description=(
+                "CCR proactive-expansion items retrieved, tagged by whether they were "
+                "actually delivered to the model or discarded (e.g. cache mode)."
+            ),
+            unit="1",
+        )
+        self._compression_events = self._meter.create_counter(
+            "headroom.compression.events",
+            description=(
+                "Per-event compression outcomes, tagged by strategy and lossy classification "
+                "(lossless / lossy_recoverable / lossy_unrecoverable)."
+            ),
+            unit="1",
+        )
+        self._compression_event_tokens_saved = self._meter.create_counter(
+            "headroom.compression.events.tokens.saved",
+            description=(
+                "Tokens saved per compression event, tagged by strategy and lossy "
+                "classification — e.g. tokens saved via lossy_unrecoverable events specifically."
+            ),
+            unit="1",
+        )
 
         # Backing values updated by record_subscription_window()
         self._sub_5h_util_val: float = 0.0
@@ -634,6 +658,43 @@ class HeadroomOtelMetrics:
         if item_count > 0:
             self._ccr_items.add(item_count, attrs)
         self._ccr_duration.record(max(duration_ms, 0.0) / _MILLISECONDS_TO_SECONDS, attrs)
+
+    def record_ccr_expansion(self, *, delivered: bool, item_count: int) -> None:
+        """Record one CCR proactive-expansion decision.
+
+        `ContextTracker.execute_expansions()` retrieves from the same
+        `CompressionStore` `record_ccr_event` already covers, but the
+        caller can compute the expansion and then not inject it — cache
+        mode discards it to preserve prefix-cache stability. Without this,
+        a `headroom.ccr.operations{outcome="hit"}` retrieve looks
+        identical whether or not the data ever reached the model.
+        `delivered=False` is expected/by-design in cache mode, not an
+        error signal.
+        """
+        self._ccr_expansion_items.add(item_count, self._attrs(delivered=str(delivered).lower()))
+
+    def record_compression_event(
+        self,
+        *,
+        strategy: str,
+        lossy: str,
+        original_tokens: int,
+        compressed_tokens: int,
+    ) -> None:
+        """Record one per-event compression outcome (see `classify_lossy`).
+
+        `lossy` is `"lossless"`, `"lossy_recoverable"`, or
+        `"lossy_unrecoverable"` — the last is the only case with no
+        recovery path and is the leading indicator for "is Headroom
+        degrading response quality." Read alongside
+        `headroom.ccr.operations{outcome="hit"}` (the trailing indicator —
+        evidence the model actually needed data back).
+        """
+        attrs = self._attrs(strategy=strategy, lossy=lossy)
+        self._compression_events.add(1, attrs)
+        saved = original_tokens - compressed_tokens
+        if saved > 0:
+            self._compression_event_tokens_saved.add(saved, attrs)
 
     def record_compression_failure(
         self,

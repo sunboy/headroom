@@ -57,6 +57,7 @@ from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
 from .content_detector import normalize_concatenated_json
+from .observability import classify_lossy
 
 logger = logging.getLogger(__name__)
 
@@ -1214,7 +1215,7 @@ class SmartCrusher(Transform):
 
         return " ".join(context_parts)
 
-    def _notify_observer(self, original_tokens: int, compressed_tokens: int) -> None:
+    def _notify_observer(self, original_tokens: int, compressed_tokens: int, lossy: str) -> None:
         """Forward a compression event to the configured
         `CompressionObserver` (see `headroom.transforms.observability`).
         No-op when no observer is set; swallows observer exceptions at
@@ -1228,6 +1229,7 @@ class SmartCrusher(Transform):
                 strategy="smart_crusher",
                 original_tokens=original_tokens,
                 compressed_tokens=compressed_tokens,
+                lossy=lossy,
             )
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("CompressionObserver raised (non-fatal): %s", e)
@@ -1305,7 +1307,17 @@ class SmartCrusher(Transform):
                             markers_inserted.append(marker)
                             if info:
                                 transforms_applied.append(f"smart:{info}")
-                            self._notify_observer(tokens, tokenizer.count_text(crushed))
+                            crushed_tokens = tokenizer.count_text(crushed)
+                            self._notify_observer(
+                                tokens,
+                                crushed_tokens,
+                                classify_lossy(
+                                    original_tokens=tokens,
+                                    compressed_tokens=crushed_tokens,
+                                    compressed_content=crushed,
+                                    lossless_hint=info.startswith("lossless:"),
+                                ),
+                            )
 
             # Anthropic-style: content is a list of blocks; each tool_result
             # block has a string content field of its own.
@@ -1341,7 +1353,17 @@ class SmartCrusher(Transform):
                         markers_inserted.append(marker)
                         if info:
                             transforms_applied.append(f"smart:{info}")
-                        self._notify_observer(tokens, tokenizer.count_text(crushed))
+                        crushed_tokens = tokenizer.count_text(crushed)
+                        self._notify_observer(
+                            tokens,
+                            crushed_tokens,
+                            classify_lossy(
+                                original_tokens=tokens,
+                                compressed_tokens=crushed_tokens,
+                                compressed_content=crushed,
+                                lossless_hint=info.startswith("lossless:"),
+                            ),
+                        )
 
         if crushed_count > 0:
             transforms_applied.insert(

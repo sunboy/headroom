@@ -507,6 +507,7 @@ class PrometheusMetrics:
         strategy: str,
         original_tokens: int,
         compressed_tokens: int,
+        lossy: str,
     ) -> None:
         """Implements `headroom.transforms.observability.CompressionObserver`.
 
@@ -526,11 +527,25 @@ class PrometheusMetrics:
         Tokens saved is `max(0, original - compressed)` — the
         observer never records "negative savings" even if a
         compressor goofs and emits more tokens than it received.
+
+        ``lossy`` (one of `classify_lossy`'s three verdicts) is not
+        tracked in the per-strategy dicts above — `compressions_by_strategy`
+        feeds `/stats` JSON only, deliberately excluded from the real
+        `/metrics` Prometheus text output. It fans out to OTEL instead,
+        where `headroom.compression.events` is the primary, queryable
+        surface for this dimension.
         """
         self.compressions_by_strategy[strategy] += 1
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+
+        self._get_otel_metrics().record_compression_event(
+            strategy=strategy,
+            lossy=lossy,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+        )
 
         # Fan out to the beacon. This object is the configured
         # CompressionObserver for the proxy's pipelines, so it is where those

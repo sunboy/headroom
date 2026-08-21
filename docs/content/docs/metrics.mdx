@@ -126,6 +126,32 @@ Confirm the exporter is live with `curl -s http://localhost:8787/stats | jq .ote
 
 If your application already configures a global OTEL meter provider, leave `HEADROOM_OTEL_*` unset — Headroom records into the ambient provider automatically.
 
+### Is Headroom degrading response quality?
+
+Headroom compresses both losslessly (structural reformatting, deduplication — no
+information removed) and lossily (content dropped or paraphrased). Two counters
+together answer whether that's actually costing you anything:
+
+- **`headroom.compression.events`** — tagged `strategy` and `lossy`
+  (`lossless` / `lossy_recoverable` / `lossy_unrecoverable`). `lossy_unrecoverable`
+  is the **leading indicator**: content was dropped with no way to get it back.
+  `lossy_recoverable` means content was dropped but a CCR marker lets the model
+  retrieve it on demand — not free, but not a dead end either.
+- **`headroom.ccr.operations{outcome="hit"}`** (see above) — the **trailing
+  indicator**: how often the model actually asked for that data back. Headroom's
+  own compression-feedback logic treats a rising retrieval rate as evidence that
+  compression was too aggressive for that traffic (the same reasoning ACON
+  research describes: retrieval churn signals over-compression).
+- **`headroom.ccr.expansion.items`** (tagged `delivered="true"|"false"`) — a
+  narrower but easy-to-misread case: cache mode's proactive-expansion path
+  (`/docs/ccr`) can retrieve context and then *not* inject it, to protect
+  prefix-cache stability. `delivered="false"` there is expected/by-design, not a
+  quality problem — don't conflate it with `lossy_unrecoverable` compression.
+
+Read them together: a high `lossy_unrecoverable` rate with a correspondingly high
+`headroom.ccr.operations{outcome="hit"}` rate on the *same* strategy is the
+strongest signal that a given compressor is too aggressive for your traffic.
+
 ### Dynatrace
 
 Point the exporter at your environment's OTLP API and add the API token as a header. The token needs the `metrics.ingest` scope.

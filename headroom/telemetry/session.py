@@ -975,8 +975,12 @@ class BeaconCompressionObserver:
     __slots__ = ()
 
     def record_compression(
-        self, strategy: str, original_tokens: int, compressed_tokens: int
+        self, strategy: str, original_tokens: int, compressed_tokens: int, lossy: str
     ) -> None:
+        # `lossy` is not forwarded to the beacon: its wire schema
+        # (`_staged_strategies`) is a separate, more sensitive
+        # data-collection surface with its own hand-tuned cap
+        # (MAX_STRATEGIES) — out of scope for this protocol extension.
         record_compression(strategy, original_tokens, compressed_tokens)
 
 

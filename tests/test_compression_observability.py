@@ -32,12 +32,14 @@ Coverage:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from headroom.tokenizer import Tokenizer
 from headroom.transforms.content_detector import ContentType
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -46,7 +48,7 @@ from headroom.transforms.content_router import (
     RouterCompressionResult,
     RoutingDecision,
 )
-from headroom.transforms.observability import CompressionObserver
+from headroom.transforms.observability import CompressionObserver, classify_lossy
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
 # ─── Test doubles ──────────────────────────────────────────────────────
@@ -56,15 +58,16 @@ from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 class SpyObserver:
     """Captures every `record_compression` call for assertion."""
 
-    calls: list[tuple[str, int, int]] = field(default_factory=list)
+    calls: list[tuple[str, int, int, str]] = field(default_factory=list)
 
     def record_compression(
         self,
         strategy: str,
         original_tokens: int,
         compressed_tokens: int,
+        lossy: str,
     ) -> None:
-        self.calls.append((strategy, original_tokens, compressed_tokens))
+        self.calls.append((strategy, original_tokens, compressed_tokens, lossy))
 
 
 @dataclass
@@ -93,6 +96,39 @@ def test_prometheus_metrics_satisfies_observer_protocol():
 
     m = PrometheusMetrics()
     assert isinstance(m, CompressionObserver)
+
+
+def test_beacon_compression_observer_satisfies_observer_protocol():
+    """No prior test exercised this observer at all — the proxy's
+    `PrometheusMetrics` is already an observer, so `BeaconCompressionObserver`
+    only fires on paths that never had one (MCP servers, bare pipeline,
+    LangChain/Strands)."""
+    from headroom.telemetry.session import BeaconCompressionObserver
+
+    beacon_observer = BeaconCompressionObserver()
+    assert isinstance(beacon_observer, CompressionObserver)
+
+
+def test_beacon_compression_observer_accepts_lossy_but_does_not_forward_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """`lossy` is required by the protocol and must not raise here, but
+    the beacon's wire payload (`_staged_strategies`) is a separate,
+    more sensitive data-collection surface — `lossy` is accepted and
+    dropped, not forwarded."""
+    from headroom.telemetry import beacon as beacon_module
+    from headroom.telemetry import session as session_module
+    from headroom.telemetry.session import BeaconCompressionObserver
+
+    monkeypatch.setattr(beacon_module, "is_beacon_enabled", lambda: True)
+    session_module._staged_strategies.clear()
+
+    BeaconCompressionObserver().record_compression(
+        "smart_crusher", original_tokens=200, compressed_tokens=50, lossy="lossy_unrecoverable"
+    )
+
+    staged = session_module._drain_staged_strategies()
+    assert staged == {"smart_crusher": [1, 200, 50]}
 
 
 # ─── ContentRouter wiring ──────────────────────────────────────────────
@@ -126,9 +162,14 @@ def test_content_router_records_observer_call_per_routing_decision():
     )
     router._observe(result)
 
+    # Both RoutingDecisions above were constructed without an explicit
+    # `lossy=`, so they carry the dataclass default ("lossless") — this
+    # test asserts wiring (does the observer get called once per
+    # decision with the right strategy/tokens/lossy), not classification
+    # accuracy for hand-built fixtures.
     assert spy.calls == [
-        ("smart_crusher", 200, 50),
-        ("code_aware", 300, 300),
+        ("smart_crusher", 200, 50, "lossless"),
+        ("code_aware", 300, 300, "lossless"),
     ]
 
 
@@ -227,10 +268,11 @@ def test_smart_crusher_apply_records_observer_per_crushed_message(isolated_toin)
     # fired in the case it crushed.
     if "smart_crush:" in ",".join(result.transforms_applied):
         assert spy.calls, "smart_crusher crushed but observer wasn't notified"
-        for strategy, original, compressed in spy.calls:
+        for strategy, original, compressed, lossy in spy.calls:
             assert strategy == "smart_crusher"
             assert original > 0
             assert compressed >= 0
+            assert lossy in ("lossless", "lossy_recoverable", "lossy_unrecoverable")
 
 
 def test_smart_crusher_apply_swallows_observer_failures(isolated_toin):
@@ -258,10 +300,18 @@ def test_prometheus_metrics_accumulates_per_strategy_counters():
 
     m = PrometheusMetrics()
 
-    m.record_compression("smart_crusher", original_tokens=200, compressed_tokens=50)
-    m.record_compression("smart_crusher", original_tokens=100, compressed_tokens=40)
-    m.record_compression("diff", original_tokens=80, compressed_tokens=80)  # no savings
-    m.record_compression("code_aware", original_tokens=50, compressed_tokens=70)  # negative savings
+    m.record_compression(
+        "smart_crusher", original_tokens=200, compressed_tokens=50, lossy="lossy_recoverable"
+    )
+    m.record_compression(
+        "smart_crusher", original_tokens=100, compressed_tokens=40, lossy="lossy_recoverable"
+    )
+    m.record_compression(
+        "diff", original_tokens=80, compressed_tokens=80, lossy="lossless"
+    )  # no savings
+    m.record_compression(
+        "code_aware", original_tokens=50, compressed_tokens=70, lossy="lossless"
+    )  # negative savings
 
     assert m.compressions_by_strategy == {
         "smart_crusher": 2,
@@ -397,8 +447,12 @@ def test_prometheus_export_does_not_leak_per_strategy_metrics():
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
     m = PrometheusMetrics()
-    m.record_compression("smart_crusher", original_tokens=200, compressed_tokens=50)
-    m.record_compression("diff", original_tokens=120, compressed_tokens=70)
+    m.record_compression(
+        "smart_crusher", original_tokens=200, compressed_tokens=50, lossy="lossy_recoverable"
+    )
+    m.record_compression(
+        "diff", original_tokens=120, compressed_tokens=70, lossy="lossy_recoverable"
+    )
 
     output = asyncio.run(m.export())
 
@@ -458,3 +512,242 @@ def test_router_with_prometheus_observer_increments_counters():
 # strategy. Inner-router observability is now exercised solely
 # through ContentRouter, covered by
 # `test_content_router_records_observer_call_per_routing_decision`.
+
+
+# ─── classify_lossy ─────────────────────────────────────────────────────
+
+
+def test_classify_lossy_zero_reduction_is_lossless():
+    assert (
+        classify_lossy(
+            original_tokens=100,
+            compressed_tokens=100,
+            compressed_content="unchanged content, no marker here",
+        )
+        == "lossless"
+    )
+
+
+def test_classify_lossy_hint_wins_over_incidental_marker():
+    """A lossless win is lossless even if an unrelated CCR marker also
+    happens to be present in the output — lossless_hint short-circuits
+    before the marker check (documented precedence in the docstring)."""
+    assert (
+        classify_lossy(
+            original_tokens=100,
+            compressed_tokens=40,
+            compressed_content="compacted content <<ccr:abc123>>",
+            lossless_hint=True,
+        )
+        == "lossless"
+    )
+
+
+def test_classify_lossy_marker_present_is_recoverable():
+    assert (
+        classify_lossy(
+            original_tokens=100,
+            compressed_tokens=40,
+            compressed_content="compacted content <<ccr:abc123>>",
+        )
+        == "lossy_recoverable"
+    )
+
+
+def test_classify_lossy_no_marker_is_unrecoverable():
+    assert (
+        classify_lossy(
+            original_tokens=100,
+            compressed_tokens=40,
+            compressed_content="compacted content, no marker at all",
+        )
+        == "lossy_unrecoverable"
+    )
+
+
+def test_classify_lossy_recognizes_all_three_marker_formats():
+    for marker_text in (
+        "Retrieve more: hash=abc123",
+        "Retrieve original: hash=abc123",
+        "<<ccr:abc123,base64,2.0KB>>",
+    ):
+        assert (
+            classify_lossy(
+                original_tokens=100,
+                compressed_tokens=40,
+                compressed_content=f"compacted content {marker_text}",
+            )
+            == "lossy_recoverable"
+        )
+
+
+# ─── ContentRouter: RoutingDecision.lossy wiring ───────────────────────
+#
+# `_apply_strategy_to_content` is monkeypatched in these tests (the same
+# pattern `test_force_kompress_apply_uses_lightweight_detection` in
+# test_transforms_content_router.py already uses) so each case is
+# deterministic and independent of ML model / network availability.
+# `test_content_router_lossless_search_fold_classifies_lossless` below
+# is the one real, unmocked end-to-end case — it's also the exact
+# regression the second Fable review caught (a fold-only lossless win
+# with no CCR marker was, before the fix, misclassified as
+# lossy_unrecoverable because `strategy_chain` never reached the
+# classifier).
+
+
+def test_content_router_lossless_search_fold_classifies_lossless():
+    """Real, unmocked: a search-result block that folds losslessly via
+    `_lossless_first` must classify as lossless even though real bytes
+    were removed and no CCR marker is present in the output."""
+    paths = [
+        "src/services/wallet/overdraft/automated_overdraft_initiation.py",
+        "src/services/wallet/overdraft/capacity_limits.py",
+    ]
+    block = (
+        "\n".join(
+            f"{p}:{ln}:    result = compute_overdraft_capacity(business_id, amount)"
+            for p in paths
+            for ln in range(1, 40)
+        )
+        + "\n"
+    )
+    router = ContentRouter(ContentRouterConfig(lossless=True))
+    result = router.compress(block, context="")
+
+    assert any(entry.startswith("lossless_") for entry in result.strategy_chain)
+    assert len(result.routing_log) == 1
+    decision = result.routing_log[0]
+    assert decision.compressed_tokens < decision.original_tokens  # real byte reduction
+    assert "<<ccr:" not in result.compressed  # no marker in a lossless fold
+    assert decision.lossy == "lossless"
+
+
+def test_content_router_pure_strategy_with_marker_classifies_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    router = ContentRouter(ContentRouterConfig())
+    monkeypatch.setattr(
+        router,
+        "_apply_strategy_to_content",
+        lambda *a, **kw: ("compacted <<ccr:abc123,base64,1.0KB>>", 40, []),
+    )
+
+    result = router._compress_pure("original content " * 20, CompressionStrategy.KOMPRESS, "")
+
+    assert len(result.routing_log) == 1
+    assert result.routing_log[0].lossy == "lossy_recoverable"
+
+
+def test_content_router_pure_strategy_no_marker_classifies_unrecoverable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """KOMPRESS/TEXT/CODE_AWARE (`LOSSY_UNMARKED_STRATEGIES`) don't always
+    insert a marker — when they don't, on real token reduction, the
+    result is genuinely unrecoverable."""
+    router = ContentRouter(ContentRouterConfig())
+    monkeypatch.setattr(
+        router,
+        "_apply_strategy_to_content",
+        lambda *a, **kw: ("compacted content, no marker at all", 40, []),
+    )
+
+    result = router._compress_pure("original content " * 20, CompressionStrategy.KOMPRESS, "")
+
+    assert len(result.routing_log) == 1
+    assert result.routing_log[0].lossy == "lossy_unrecoverable"
+
+
+def test_content_router_passthrough_placeholder_classifies_lossless():
+    """A `<system-reminder>` block is protected before section-splitting
+    (content_router.py's `_compress_mixed`) and its section is passed
+    through verbatim — a zero-reduction no-op that must classify as
+    lossless regardless of marker/chain. Calling `_compress_mixed`
+    directly (real, unmocked) skips only the `is_mixed_content` routing
+    gate, not the protected-placeholder logic itself."""
+    content = (
+        "some prose text here as padding to make a real section\n"
+        "<system-reminder>\n"
+        "protected block content that should survive verbatim, padded further\n"
+        "</system-reminder>\n\n"
+        "more prose text after the block goes here as well, padded further too\n"
+    )
+    router = ContentRouter(ContentRouterConfig())
+    result = router._compress_mixed(content, context="")
+
+    matching = [d for d in result.routing_log if d.strategy == CompressionStrategy.PASSTHROUGH]
+    assert matching, "expected at least one PASSTHROUGH routing decision"
+    for decision in matching:
+        assert decision.original_tokens == decision.compressed_tokens
+        assert decision.lossy == "lossless"
+
+
+# ─── SmartCrusher: _notify_observer lossy wiring ───────────────────────
+#
+# Uses EstimatingTokenCounter (no network) rather than OpenAITokenCounter,
+# since tiktoken's BPE download is unavailable in this sandbox.
+
+
+def test_smart_crusher_lossless_table_win_classifies_lossless(isolated_toin):
+    """Real, unmocked: a uniform JSON array that SmartCrusher's Rust path
+    compacts into a table (dropping zero rows) reports Rust's own
+    `info="lossless:table(...)"` tag, which must win over the marker
+    check — even though a (non-CCR) tool-digest marker is always
+    appended regardless."""
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+    items = [{"id": i, "status": "ok", "tag": "x" * 20} for i in range(200)]
+    content = json.dumps(items)
+    crusher = SmartCrusher(SmartCrusherConfig(), observer=(spy := SpyObserver()))
+    tok = Tokenizer(EstimatingTokenCounter(), model="estimate")
+
+    crusher.apply([{"role": "tool", "content": content}], tok)
+
+    assert spy.calls, "expected smart_crusher to fire the observer"
+    strategy, original, compressed, lossy = spy.calls[0]
+    assert strategy == "smart_crusher"
+    assert compressed < original  # real byte reduction from table compaction
+    assert lossy == "lossless"
+
+
+def test_smart_crusher_row_drop_with_marker_classifies_recoverable(isolated_toin):
+    """`_smart_crush_content` is monkeypatched to force the row-drop path
+    with a genuine CCR marker embedded — deterministic, independent of
+    which real-world content shape happens to trigger row-drop vs. table
+    compaction in the Rust crusher."""
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+    crusher = SmartCrusher(SmartCrusherConfig(), observer=(spy := SpyObserver()))
+    crusher._smart_crush_content = lambda content, query_context=None: (
+        "kept a few rows <<ccr:abc123,base64,4.0KB>>",
+        True,
+        "top_n",
+    )
+    tok = Tokenizer(EstimatingTokenCounter(), model="estimate")
+    content = json.dumps([{"id": i, "msg": f"entry {i}"} for i in range(100)])
+
+    crusher.apply([{"role": "tool", "content": content}], tok)
+
+    assert spy.calls, "expected smart_crusher to fire the observer"
+    strategy, original, compressed, lossy = spy.calls[0]
+    assert lossy == "lossy_recoverable"
+
+
+def test_smart_crusher_row_drop_without_marker_classifies_unrecoverable(isolated_toin):
+    """Same as above, but the forced row-drop result carries no CCR
+    marker — the only case with no recovery path."""
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+    crusher = SmartCrusher(SmartCrusherConfig(), observer=(spy := SpyObserver()))
+    crusher._smart_crush_content = lambda content, query_context=None: (
+        "kept a few rows, no marker at all",
+        True,
+        "smart_sample",
+    )
+    tok = Tokenizer(EstimatingTokenCounter(), model="estimate")
+    content = json.dumps([{"id": i, "msg": f"entry {i}"} for i in range(100)])
+
+    crusher.apply([{"role": "tool", "content": content}], tok)
+
+    assert spy.calls, "expected smart_crusher to fire the observer"
+    strategy, original, compressed, lossy = spy.calls[0]
+    assert lossy == "lossy_unrecoverable"

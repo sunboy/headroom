@@ -250,6 +250,60 @@ def test_headroom_otel_metrics_records_ccr_events() -> None:
     assert hit_duration.sum == pytest.approx(0.0008)
 
 
+def test_headroom_otel_metrics_records_compression_events() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    otel_metrics.record_compression_event(
+        strategy="search", lossy="lossless", original_tokens=100, compressed_tokens=100
+    )
+    otel_metrics.record_compression_event(
+        strategy="smart_crusher",
+        lossy="lossy_recoverable",
+        original_tokens=200,
+        compressed_tokens=50,
+    )
+    otel_metrics.record_compression_event(
+        strategy="kompress", lossy="lossy_unrecoverable", original_tokens=300, compressed_tokens=80
+    )
+
+    metrics = _collect_metrics(reader)
+
+    events = metrics["headroom.compression.events"]
+    lossless_point = _find_point(events, strategy="search", lossy="lossless")
+    assert lossless_point.value == 1
+    recoverable_point = _find_point(events, strategy="smart_crusher", lossy="lossy_recoverable")
+    assert recoverable_point.value == 1
+    unrecoverable_point = _find_point(events, strategy="kompress", lossy="lossy_unrecoverable")
+    assert unrecoverable_point.value == 1
+
+    saved = metrics["headroom.compression.events.tokens.saved"]
+    # The lossless event saved zero tokens and must not create a data point.
+    assert len(saved.data.data_points) == 2
+    recoverable_saved = _find_point(saved, strategy="smart_crusher", lossy="lossy_recoverable")
+    assert recoverable_saved.value == 150
+    unrecoverable_saved = _find_point(saved, strategy="kompress", lossy="lossy_unrecoverable")
+    assert unrecoverable_saved.value == 220
+
+
+def test_headroom_otel_metrics_records_ccr_expansion() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    otel_metrics.record_ccr_expansion(delivered=True, item_count=3)
+    otel_metrics.record_ccr_expansion(delivered=False, item_count=5)
+
+    metrics = _collect_metrics(reader)
+
+    items = metrics["headroom.ccr.expansion.items"]
+    delivered_point = _find_point(items, delivered="true")
+    assert delivered_point.value == 3
+    discarded_point = _find_point(items, delivered="false")
+    assert discarded_point.value == 5
+
+
 def test_get_otel_meter_uses_headrooms_configured_provider() -> None:
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])

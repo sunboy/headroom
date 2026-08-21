@@ -87,6 +87,7 @@ from .lossless_provider import (
     get_lossless_verifier,
 )
 from .mixed_content import ContentSection, mixed_content_indicators
+from .observability import classify_lossy
 from .relevance_split import build_relevance_query, plan_relevance_split
 
 logger = logging.getLogger(__name__)
@@ -1378,6 +1379,11 @@ class RoutingDecision:
     compressed_tokens: int
     confidence: float = 1.0
     section_index: int = 0
+    lossy: str = "lossless"
+    """`classify_lossy`'s verdict for this decision — computed by the
+    caller at construction time (`strategy_chain`/compressed content are
+    in scope there, not later at observer-notification time) via
+    `headroom.transforms.observability.classify_lossy`."""
 
     @property
     def compression_ratio(self) -> float:
@@ -2287,6 +2293,7 @@ class ContentRouter(Transform):
                     strategy=d.strategy.value,
                     original_tokens=d.original_tokens,
                     compressed_tokens=d.compressed_tokens,
+                    lossy=d.lossy,
                 )
             except Exception as e:  # pragma: no cover - defensive
                 logger.debug("CompressionObserver raised (non-fatal): %s", e)
@@ -2473,6 +2480,11 @@ class ContentRouter(Transform):
                         original_tokens=section_tokens,
                         compressed_tokens=section_tokens,
                         section_index=i,
+                        lossy=classify_lossy(
+                            original_tokens=section_tokens,
+                            compressed_tokens=section_tokens,
+                            compressed_content=section.content,
+                        ),
                     )
                 )
                 continue
@@ -2482,7 +2494,7 @@ class ContentRouter(Transform):
 
             # Compress section
             original_tokens = _estimate_tokens(section.content)
-            compressed_content, compressed_tokens, _section_chain = self._apply_strategy_to_content(
+            compressed_content, compressed_tokens, section_chain = self._apply_strategy_to_content(
                 section.content,
                 strategy,
                 context,
@@ -2503,6 +2515,12 @@ class ContentRouter(Transform):
                     original_tokens=original_tokens,
                     compressed_tokens=compressed_tokens,
                     section_index=i,
+                    lossy=classify_lossy(
+                        original_tokens=original_tokens,
+                        compressed_tokens=compressed_tokens,
+                        compressed_content=compressed_content,
+                        lossless_hint=any(entry.startswith("lossless_") for entry in section_chain),
+                    ),
                 )
             )
 
@@ -2555,6 +2573,14 @@ class ContentRouter(Transform):
                     strategy=strategy,
                     original_tokens=original_tokens,
                     compressed_tokens=compressed_tokens,
+                    lossy=classify_lossy(
+                        original_tokens=original_tokens,
+                        compressed_tokens=compressed_tokens,
+                        compressed_content=compressed,
+                        lossless_hint=any(
+                            entry.startswith("lossless_") for entry in strategy_chain
+                        ),
+                    ),
                 )
             ],
         )
