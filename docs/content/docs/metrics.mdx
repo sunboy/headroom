@@ -118,6 +118,9 @@ Exported counters include `headroom.proxy.requests`, `headroom.proxy.tokens.inpu
 message/compression savings plus tool-schema deferral savings. The component counter
 `headroom.proxy.tokens.tool_schema_saved` exposes the deferral portion separately;
 `headroom.compression.tokens.saved` remains the compression-pipeline component.
+`headroom.ccr.operations`, `headroom.ccr.items`, and `headroom.ccr.operation.duration`
+cover [CCR](/docs/ccr) store/retrieve activity, tagged with `operation` and an `outcome`
+of `stored`, `hit`, `miss`, `expired`, or `rejected`.
 
 Confirm the exporter is live with `curl -s http://localhost:8787/stats | jq .otel`.
 

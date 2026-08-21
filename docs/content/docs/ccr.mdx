@@ -168,6 +168,22 @@ HEADROOM_CCR_TTL_SECONDS=7200 headroom proxy
 Check the effective setting at `/v1/retrieve/stats` under
 `store.default_ttl_seconds`.
 
+## Observability
+
+Every store and retrieve reports through Headroom's [OTEL metrics](/docs/metrics) —
+`headroom.ccr.operations` (count, tagged `operation="store"|"retrieve"` and
+`outcome="stored"|"hit"|"miss"|"expired"|"rejected"`), `headroom.ccr.items`, and
+`headroom.ccr.operation.duration`. `miss` and `expired` are reported separately —
+a retrieve that finds nothing versus one whose entry TTL-lapsed are different
+signals. Because this is instrumented at the `CompressionStore` layer, it covers
+CCR activity from the proxy, the streaming handler, and the standalone
+`headroom mcp serve` path alike. Enable it the same way as any other Headroom
+OTEL metric:
+
+```bash
+HEADROOM_OTEL_METRICS_ENABLED=1 HEADROOM_OTEL_METRICS_EXPORTER=console headroom proxy
+```
+
 ## Message-level CCR
 
 > **Retired:** The "Message-level CCR via IntelligentContext" feature (where `IntelligentContext` would store dropped messages in CCR with a retrieval marker) was part of the `IntelligentContextConfig` API that has since been removed. Context management is now handled automatically by the pipeline without a separate configurable IntelligentContext stage. Tool-output CCR via SmartCrusher and ContentRouter remains fully supported.

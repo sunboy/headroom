@@ -196,6 +196,60 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
     assert waste_point.value == 12
 
 
+def test_headroom_otel_metrics_records_ccr_events() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    otel_metrics.record_ccr_event(
+        operation="store",
+        outcome="stored",
+        duration_ms=1.5,
+        item_count=20,
+        tool_name="search_api",
+    )
+    otel_metrics.record_ccr_event(
+        operation="retrieve",
+        outcome="hit",
+        duration_ms=0.8,
+        item_count=20,
+        tool_name="search_api",
+    )
+    otel_metrics.record_ccr_event(
+        operation="retrieve",
+        outcome="miss",
+        duration_ms=0.2,
+    )
+    otel_metrics.record_ccr_event(
+        operation="retrieve",
+        outcome="expired",
+        duration_ms=0.3,
+    )
+
+    metrics = _collect_metrics(reader)
+
+    operations = metrics["headroom.ccr.operations"]
+    store_point = _find_point(operations, operation="store", outcome="stored")
+    assert store_point.value == 1
+    hit_point = _find_point(operations, operation="retrieve", outcome="hit")
+    assert hit_point.value == 1
+    miss_point = _find_point(operations, operation="retrieve", outcome="miss")
+    assert miss_point.value == 1
+    expired_point = _find_point(operations, operation="retrieve", outcome="expired")
+    assert expired_point.value == 1
+
+    items = metrics["headroom.ccr.items"]
+    store_items = _find_point(items, operation="store", outcome="stored")
+    assert store_items.value == 20
+    # Zero-item events (miss/expired) never touch the items counter.
+    assert len(items.data.data_points) == 2
+
+    duration = metrics["headroom.ccr.operation.duration"]
+    hit_duration = _find_point(duration, operation="retrieve", outcome="hit")
+    assert hit_duration.count == 1
+    assert hit_duration.sum == pytest.approx(0.0008)
+
+
 def test_get_otel_meter_uses_headrooms_configured_provider() -> None:
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])

@@ -357,6 +357,21 @@ class HeadroomOtelMetrics:
             description="Attributed cost delta; negative values represent added cost.",
             unit="USD",
         )
+        self._ccr_operations = self._meter.create_counter(
+            "headroom.ccr.operations",
+            description="CCR (Compress-Cache-Retrieve) store/retrieve operations.",
+            unit="1",
+        )
+        self._ccr_items = self._meter.create_counter(
+            "headroom.ccr.items",
+            description="Items stored or retrieved through Headroom's CCR cache.",
+            unit="1",
+        )
+        self._ccr_duration = self._meter.create_histogram(
+            "headroom.ccr.operation.duration",
+            description="CCR store/retrieve operation duration.",
+            unit="s",
+        )
 
         # Backing values updated by record_subscription_window()
         self._sub_5h_util_val: float = 0.0
@@ -590,6 +605,35 @@ class HeadroomOtelMetrics:
                         token_count,
                         self._attrs(model=model, provider=provider, signal=signal_name),
                     )
+
+    def record_ccr_event(
+        self,
+        *,
+        operation: str,
+        outcome: str,
+        duration_ms: float,
+        item_count: int = 0,
+        tool_name: str | None = None,
+    ) -> None:
+        """Record one CCR (Compress-Cache-Retrieve) store or retrieve event.
+
+        ``operation`` is ``"store"`` or ``"retrieve"``. ``outcome`` is
+        ``"stored"`` for a successful store, or ``"hit"`` / ``"miss"`` /
+        ``"expired"`` for a retrieve — ``CompressionStore.retrieve()``
+        returns ``None`` for both a missing and a TTL-lapsed entry, and
+        that distinction is exactly the signal telemetry should keep
+        (mirrors how cache-miss attribution already separates TTL expiry
+        from prefix change for provider prompt caching).
+        """
+        attrs = self._attrs(
+            operation=operation,
+            outcome=outcome,
+            **{"headroom.ccr.tool_name": tool_name},
+        )
+        self._ccr_operations.add(1, attrs)
+        if item_count > 0:
+            self._ccr_items.add(item_count, attrs)
+        self._ccr_duration.record(max(duration_ms, 0.0) / _MILLISECONDS_TO_SECONDS, attrs)
 
     def record_compression_failure(
         self,

@@ -312,6 +312,10 @@ class CompressionStore:
         Returns:
             Hash key for retrieving this content.
         """
+        from ..observability import get_otel_metrics
+
+        t_start = time.perf_counter()
+
         # Generate hash from original content. Default: SHA-256[:24] of the
         # original. When the caller provides `explicit_hash`, use it
         # verbatim — required when the hash that ends up in the prompt
@@ -369,6 +373,12 @@ class CompressionStore:
                 tool_name,
                 compression_strategy,
                 len(stripped),
+            )
+            get_otel_metrics().record_ccr_event(
+                operation="store",
+                outcome="rejected",
+                duration_ms=(time.perf_counter() - t_start) * 1000,
+                tool_name=tool_name,
             )
             return hash_key
 
@@ -430,6 +440,13 @@ class CompressionStore:
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
 
+        get_otel_metrics().record_ccr_event(
+            operation="store",
+            outcome="stored",
+            duration_ms=(time.perf_counter() - t_start) * 1000,
+            item_count=compressed_item_count,
+            tool_name=tool_name,
+        )
         return hash_key
 
     def retrieve(
@@ -446,51 +463,73 @@ class CompressionStore:
         Returns:
             CompressionEntry if found and not expired, None otherwise.
         """
+        from ..observability import get_otel_metrics
+
+        t_start = time.perf_counter()
+        # "miss" (never stored / already evicted) and "expired" (stored, but
+        # TTL-lapsed) are both a `None` return to callers, but they are a
+        # different operational signal — keep them distinct for telemetry the
+        # same way cache-miss attribution already separates TTL expiry from
+        # prefix change for provider prompt caching.
+        outcome = "miss"
+        result_entry: CompressionEntry | None = None
+
         with self._lock:
             entry = self._backend.get(hash_key)
 
             if entry is None:
-                return None
-
-            if entry.is_expired():
+                outcome = "miss"
+            elif entry.is_expired():
                 self._backend.delete(hash_key)
                 # CRITICAL FIX: Track stale heap entry
                 self._stale_heap_entries += 1
-                return None
+                outcome = "expired"
+            else:
+                outcome = "hit"
 
-            # Track access for feedback
-            entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
+                # Track access for feedback
+                entry.record_access(query)
+                # Update the backend with the modified entry
+                self._backend.set(hash_key, entry)
 
-            # Log retrieval event
-            if self._enable_feedback:
-                self._log_retrieval(
+                # Log retrieval event
+                if self._enable_feedback:
+                    self._log_retrieval(
+                        hash_key=hash_key,
+                        query=query,
+                        items_retrieved=entry.original_item_count,
+                        total_items=entry.original_item_count,
+                        tool_name=entry.tool_name,
+                        retrieval_type="full",
+                        tool_signature_hash=entry.tool_signature_hash,
+                    )
+                self._log_retrieval_payload(
                     hash_key=hash_key,
                     query=query,
+                    retrieval_type="full",
+                    payload=entry.original_content,
                     items_retrieved=entry.original_item_count,
                     total_items=entry.original_item_count,
-                    tool_name=entry.tool_name,
-                    retrieval_type="full",
-                    tool_signature_hash=entry.tool_signature_hash,
+                    entry=entry,
                 )
-            self._log_retrieval_payload(
-                hash_key=hash_key,
-                query=query,
-                retrieval_type="full",
-                payload=entry.original_content,
-                items_retrieved=entry.original_item_count,
-                total_items=entry.original_item_count,
-                entry=entry,
-            )
 
-            # CRITICAL: Make a deep copy to return
-            # (entry could be modified/evicted after lock release)
-            # The entry contains mutable fields (search_queries list) that must be copied
-            result_entry = replace(entry, search_queries=list(entry.search_queries))
+                # CRITICAL: Make a deep copy to return
+                # (entry could be modified/evicted after lock release)
+                # The entry contains mutable fields (search_queries list) that must be copied
+                result_entry = replace(entry, search_queries=list(entry.search_queries))
+
+        get_otel_metrics().record_ccr_event(
+            operation="retrieve",
+            outcome=outcome,
+            duration_ms=(time.perf_counter() - t_start) * 1000,
+            item_count=result_entry.original_item_count if result_entry else 0,
+            tool_name=result_entry.tool_name if result_entry else None,
+        )
 
         # Process feedback immediately to ensure TOIN learns in real-time
-        if self._enable_feedback:
+        # (only reachable on a hit — the original early-return-on-miss/expired
+        # behavior is preserved via the outcome check).
+        if self._enable_feedback and outcome == "hit":
             self.process_pending_feedback()
 
         return result_entry
