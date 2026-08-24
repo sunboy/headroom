@@ -156,8 +156,12 @@ response = client.chat.completions.create(
     messages=messages,
 )
 
-# CCR is enabled by default in the current proxy path. Use --no-optimize for
-# full passthrough behavior.
+# CCR is enabled by default in the current proxy path and is controlled
+# independently of text compression. --no-optimize does NOT disable CCR —
+# it only turns off text compression. To disable CCR tool injection
+# specifically, use --no-ccr-inject-tool. For full passthrough (no
+# compression, no CCR, no memory injection) on a given request, send the
+# header x-headroom-bypass: true instead.
 ```
 </Tab>
 </Tabs>

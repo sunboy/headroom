@@ -201,6 +201,30 @@ Compression-only endpoint. Compresses messages without calling any LLM. Used by 
 
 Set `x-headroom-bypass: true` to skip compression.
 
+## Transform controls
+
+Headroom applies several independent transforms to a request. There is no
+single flag that disables all of them — `--no-optimize` in particular only
+disables text compression, despite its name. Use this table to find the
+control for the transform you actually want to turn off:
+
+| Transform | What it does | Disable with |
+|---|---|---|
+| Text compression | Kompress / structural compression of prose and code content | `--no-optimize` (server-wide) |
+| Image compression | Token-optimizes/downsamples image content in messages | `--no-image-optimize` / `HEADROOM_NO_IMAGE_OPTIMIZE` (server-wide) |
+| CCR tool injection | Injects the `headroom_retrieve` tool so the model can pull back compressed content | `--no-ccr-inject-tool` / `HEADROOM_NO_CCR_INJECT_TOOL` (server-wide) |
+| CCR system instructions | Injects CCR usage instructions into the system prompt | `ccr_inject_system_instructions` is off by default; see `ProxyConfig` |
+| CCR retrieval markers | Adds retrieval markers to compressed content | `--no-ccr-marker` / `HEADROOM_NO_CCR_MARKER` (server-wide) |
+| Memory injection | Injects memory context/tools when a memory handler is configured | `--no-memory-context`, `--no-memory-tools`, or don't pass `--memory` (server-wide) |
+| Tool ordering | Sorts the `tools` array into a deterministic order so the provider prompt-cache prefix stays stable | **No control today.** It is not gated by `--no-optimize`, and currently still runs under `x-headroom-bypass` — see caveat below |
+| **Everything above, for one request** | All transforms | `x-headroom-bypass: true` or `x-headroom-mode: passthrough` request header (per-request; see caveat below) |
+
+**Bypass caveat:** `x-headroom-bypass: true` skips compression, image
+optimization, CCR injection, and memory injection. Tool-array reordering
+under bypass is being hardened in a separate change — until that lands,
+don't rely on bypass for byte-for-byte-identical request bytes, only for
+"no compression / no injection".
+
 ## Agent wrapping
 
 Use `headroom wrap` to transparently proxy any CLI tool:

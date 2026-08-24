@@ -20,9 +20,11 @@ headroom proxy [OPTIONS]
 | `--mode` | `token` | Optimization mode: `token` or `cache` |
 | `--workers` | `1` | Uvicorn worker processes |
 | `--limit-concurrency` | `1000` | Maximum concurrent connections before 503 |
-| `--no-optimize` | `false` | Passthrough mode |
+| `--no-optimize` | `false` | Disable text compression only — NOT full passthrough. Image compression, CCR tool injection, and memory injection keep running; see `--no-image-optimize` / `--no-ccr-inject-tool`. For full passthrough use the `x-headroom-bypass: true` request header instead. |
+| `--no-image-optimize` | `false` | Disable image compression/token optimization (env: `HEADROOM_NO_IMAGE_OPTIMIZE`) |
 | `--no-cache` | `false` | Disable semantic cache |
 | `--no-rate-limit` | `false` | Disable rate limiting |
+| `--no-ccr-inject-tool` | `false` | Disable CCR `headroom_retrieve` tool injection (env: `HEADROOM_NO_CCR_INJECT_TOOL`) |
 | `--memory` | `false` | Enable persistent memory |
 | `--learn` | `false` | Enable live traffic learning |
 | `--backend` | `anthropic` | Backend: anthropic, bedrock, openrouter, anyllm, or litellm-* |
