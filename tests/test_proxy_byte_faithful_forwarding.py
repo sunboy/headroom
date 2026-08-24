@@ -335,6 +335,30 @@ def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
     return TestClient(app), transport
 
 
+def _make_default_app() -> tuple[TestClient, _CapturingTransport]:
+    """Boot a proxy with DEFAULT config (optimize=True) and a capturing transport.
+
+    Used by the bypass tests: bypass must short-circuit every body mutation
+    even when the proxy is otherwise running with optimization enabled — the
+    header contract is "full passthrough regardless of what normal mode
+    would have done", not merely "same as ``optimize=False``".
+    """
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+    )
+    app = create_app(config)
+    transport = _CapturingTransport()
+    proxy = app.state.proxy
+    proxy.http_client = httpx.AsyncClient(transport=transport)
+    fake_tracker = _FakePrefixTracker(frozen_count=0)
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
+    proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    return TestClient(app), transport
+
+
 def test_passthrough_no_mutation_byte_equal_sha256() -> None:
     """No transform → upstream SHA-256 equals client-sent SHA-256."""
     client, transport = _make_no_optimize_app()
@@ -482,6 +506,194 @@ def test_anthropic_tools_unsorted_reordered_and_canonicalized() -> None:
     upstream = transport.captured_body or b""
     assert upstream == expected_bytes
     assert upstream != inbound_bytes
+
+
+# ---------------------------------------------------------------------------
+# x-headroom-bypass / x-headroom-mode: passthrough must short-circuit ALL
+# body mutation, including deterministic tool sorting. Tool sorting is a
+# legitimate optimization (it stabilizes the Anthropic prompt-cache prefix),
+# so it correctly runs in normal/optimized mode above — but bypass promises
+# full passthrough and must win over it.
+# ---------------------------------------------------------------------------
+
+
+def _unsorted_tools_inbound_bytes() -> bytes:
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+        "tools": [
+            {"name": "zeta", "description": "later"},
+            {"name": "alpha"},
+        ],
+    }
+    return serialize_body_canonical(inbound_dict)
+
+
+def test_anthropic_tools_unsorted_preserved_under_bypass_header() -> None:
+    """DEFAULT config (optimize=True) + x-headroom-bypass: true → byte-faithful.
+
+    Before the fix: tool sorting ran unconditionally, so this failed
+    (upstream != inbound, tools reordered) even though bypass promises full
+    passthrough.
+    """
+    client, transport = _make_default_app()
+    inbound_bytes = _unsorted_tools_inbound_bytes()
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-headroom-bypass": "true",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes, (
+        f"Bypass must forward the client's tool order verbatim; upstream={upstream!r}"
+    )
+
+
+def test_anthropic_tools_unsorted_preserved_under_passthrough_mode_header() -> None:
+    """DEFAULT config (optimize=True) + x-headroom-mode: passthrough → byte-faithful."""
+    client, transport = _make_default_app()
+    inbound_bytes = _unsorted_tools_inbound_bytes()
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-headroom-mode": "passthrough",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes, (
+        f"Bypass must forward the client's tool order verbatim; upstream={upstream!r}"
+    )
+
+
+def test_anthropic_bypass_preserves_body_without_tools() -> None:
+    """Bypass byte-faithfulness isn't tools-specific: a request with no
+    ``tools`` key at all must also pass through untouched under bypass, even
+    with default (optimize=True) config."""
+    client, transport = _make_default_app()
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "hello there, this is a plain request"},
+        ],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-headroom-bypass": "true",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes, f"upstream={upstream!r}"
+
+
+def test_anthropic_bypass_does_not_log_body_mutated_true() -> None:
+    """The operator-facing ``body_mutated=true`` signal must not fire for a
+    bypassed request — it's the log line an operator watches to notice
+    prompt-cache-affecting mutation, and bypass promises there is none."""
+    import logging
+
+    proxy_logger = logging.getLogger("headroom.proxy")
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=logging.INFO)
+    prev_level = proxy_logger.level
+    proxy_logger.addHandler(handler)
+    proxy_logger.setLevel(logging.INFO)
+    try:
+        client, transport = _make_default_app()
+        inbound_bytes = _unsorted_tools_inbound_bytes()
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+                "x-headroom-bypass": "true",
+            },
+            content=inbound_bytes,
+        )
+        assert response.status_code == 200, response.text
+    finally:
+        proxy_logger.removeHandler(handler)
+        proxy_logger.setLevel(prev_level)
+
+    outbound_lines = [r.getMessage() for r in records if "event=outbound_request" in r.getMessage()]
+    assert outbound_lines, f"no outbound_request log emitted; records={[r.getMessage() for r in records]!r}"
+    for line in outbound_lines:
+        assert "body_mutated=true" not in line, f"bypassed request logged mutation: {line}"
+        assert "body_mutated=false" in line, f"expected body_mutated=false: {line}"
+
+
+def test_anthropic_batch_bypass_header_preserves_body() -> None:
+    """POST /v1/messages/batches with x-headroom-bypass: true is byte-faithful.
+
+    Before the fix, handle_anthropic_batch_create never read the bypass
+    headers at all: tool sorting, compression, and CCR injection always ran
+    for every batch request regardless of the header.
+    """
+    client, transport = _make_default_app()
+    inbound_dict = {
+        "requests": [
+            {
+                "custom_id": "req-1",
+                "params": {
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 128,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [
+                        {"name": "zeta", "description": "z"},
+                        {"name": "alpha", "description": "a"},
+                    ],
+                },
+            }
+        ]
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+
+    # The batch transport returns a batch-shaped response, not a message
+    # response; the capturing transport's response body doesn't matter here
+    # since we only assert on what was sent upstream.
+    response = client.post(
+        "/v1/messages/batches",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-headroom-bypass": "true",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes, (
+        f"Batch bypass must forward the client's request verbatim; upstream={upstream!r}"
+    )
 
 
 def test_anthropic_presend_sorted_empty_tools_keeps_body_unmutated() -> None:

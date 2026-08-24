@@ -29,7 +29,7 @@ from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import _headroom_bypass_enabled, extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
@@ -605,6 +605,20 @@ class AnthropicHandlerMixin:
             if isinstance(body_model, str) and model != body_model:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
+            # Bypass: skip ALL compression, TOIN learning, and CCR injection
+            # when the caller explicitly opts out via header.
+            # Prevents Headroom from corrupting sub-agent API calls
+            # (e.g., Claude Code sub-agents that inherit ANTHROPIC_BASE_URL).
+            # Computed before the INPUT_RECEIVED pipeline-extension emit below
+            # (rather than after, as it once was) so every body mutation from
+            # this point on can consult it. Note: this does not gate the
+            # INPUT_RECEIVED emit itself — a discover=True operator-configured
+            # extension can still rewrite body["tools"] at that stage; default
+            # deployments (discover=False) never reach it.
+            _bypass = _headroom_bypass_enabled(request.headers)
+            if _bypass:
+                logger.info(f"[{request_id}] Bypass: skipping compression (header)")
+
             messages = body.get("messages", [])
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
@@ -644,17 +658,6 @@ class AnthropicHandlerMixin:
                 )
 
             stream = pipeline_stream
-
-            # Bypass: skip ALL compression, TOIN learning, and CCR injection
-            # when the caller explicitly opts out via header.
-            # Prevents Headroom from corrupting sub-agent API calls
-            # (e.g., Claude Code sub-agents that inherit ANTHROPIC_BASE_URL).
-            _bypass = (
-                request.headers.get("x-headroom-bypass", "").lower() == "true"
-                or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
-            )
-            if _bypass:
-                logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen
@@ -1721,9 +1724,15 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                sorted_tools = self._sort_tools_deterministically(tools)
-                if sorted_tools != tools:
-                    tools = sorted_tools
+                # Deterministic tool sorting stabilizes the Anthropic
+                # prompt-cache prefix — it is an optimization, so it must
+                # not run under explicit bypass (x-headroom-bypass /
+                # x-headroom-mode: passthrough), which promises full
+                # passthrough of the client's request.
+                if not _bypass:
+                    sorted_tools = self._sort_tools_deterministically(tools)
+                    if sorted_tools != tools:
+                        tools = sorted_tools
                 if tools != _original_tools:
                     body["tools"] = tools
 
@@ -1743,9 +1752,12 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                sorted_tools = self._sort_tools_deterministically(presend_event.tools)
-                if sorted_tools != presend_event.tools:
-                    tools = sorted_tools
+                if not _bypass:
+                    sorted_tools = self._sort_tools_deterministically(presend_event.tools)
+                    if sorted_tools != presend_event.tools:
+                        tools = sorted_tools
+                    else:
+                        tools = presend_event.tools
                 else:
                     tools = presend_event.tools
                 if tools or body.get("tools") is not None:
@@ -2626,13 +2638,24 @@ class AnthropicHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.ccr import CCRToolInjector
-        from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
+        from headroom.proxy.helpers import (
+            MAX_REQUEST_BODY_SIZE,
+            _headroom_bypass_enabled,
+            read_request_json_with_bytes,
+        )
         from headroom.proxy.modes import is_cache_mode
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
         request_id = await self._next_request_id()
+
+        # Bypass: skip tool sorting, compression, and CCR injection for the
+        # whole batch when the caller explicitly opts out via header. Mirrors
+        # the same header contract as handle_anthropic_messages.
+        _bypass = _headroom_bypass_enabled(request.headers)
+        if _bypass:
+            logger.info(f"[{request_id}] Batch bypass: skipping compression (header)")
 
         # Check request body size
         content_length = request.headers.get("content-length")
@@ -2650,7 +2673,7 @@ class AnthropicHandlerMixin:
 
         # Parse request
         try:
-            body = await _read_request_json(request)
+            body, original_body_bytes = await read_request_json_with_bytes(request)
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -2706,7 +2729,7 @@ class AnthropicHandlerMixin:
             params = batch_req.get("params", {})
             canonical_params = dict(params)
             original_tools = canonical_params.get("tools")
-            if original_tools is not None:
+            if original_tools is not None and not _bypass:
                 sorted_tools = self._sort_tools_deterministically(original_tools)
                 if sorted_tools != original_tools:
                     canonical_params["tools"] = sorted_tools
@@ -2714,8 +2737,11 @@ class AnthropicHandlerMixin:
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
 
-            if not messages or not self.config.optimize:
-                # No messages or optimization disabled - pass through unchanged
+            if not messages or not self.config.optimize or _bypass:
+                # No messages, optimization disabled, or explicit bypass -
+                # pass through unchanged (bypass also skips CCR injection
+                # below, since that code path is unreachable once we
+                # continue here).
                 compressed_requests.append(
                     {
                         "custom_id": custom_id,
@@ -2823,15 +2849,35 @@ class AnthropicHandlerMixin:
         # Forward request to Anthropic
         url = f"{self.ANTHROPIC_API_URL}/v1/messages/batches"
 
+        # Byte-faithful forwarding: under bypass, tool sort/compression/CCR
+        # were all skipped above, so the body should be structurally
+        # identical to what the client sent. Verify against the original
+        # bytes as a safety net (mirrors handle_anthropic_messages) rather
+        # than assuming; forward the original bytes verbatim only when
+        # confirmed unmutated. Outside bypass, batch always re-serializes
+        # canonically as before.
+        if _bypass:
+            try:
+                parsed_original = json.loads(original_body_bytes)
+                batch_body_mutated = parsed_original != body
+            except (json.JSONDecodeError, ValueError):
+                batch_body_mutated = True
+            batch_mutation_reasons = (
+                [] if not batch_body_mutated else ["structural_diff_vs_original"]
+            )
+        else:
+            batch_body_mutated = True
+            batch_mutation_reasons = ["batch_compression"]
+
         try:
-            # Body is always mutated for batch (compressed requests).
             response = await self._retry_request(
                 "POST",
                 url,
                 headers,
                 body,
-                body_mutated=True,
-                mutation_reasons=["batch_compression"],
+                original_body_bytes=original_body_bytes if _bypass else None,
+                body_mutated=batch_body_mutated,
+                mutation_reasons=batch_mutation_reasons,
                 request_id=request_id,
                 forwarder_name="anthropic_batch",
                 path_for_log="/v1/messages/batches",
