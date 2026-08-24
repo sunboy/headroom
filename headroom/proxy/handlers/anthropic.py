@@ -504,6 +504,13 @@ class AnthropicHandlerMixin:
                     "read_request_json",
                     "deep_copy",
                     "compression_first_stage",
+                    # Per-request counterpart to the aggregate
+                    # ``queue_wait_seconds_total`` compression-executor
+                    # gauge — how long THIS request's compression job sat
+                    # queued before a worker picked it up. Recorded inside
+                    # ``compression_first_stage`` (a subset of it), not a
+                    # separate serial phase.
+                    "compression_queue_wait",
                     "memory_context",
                     "upstream_connect",
                     "upstream_first_byte",
@@ -1078,6 +1085,7 @@ class AnthropicHandlerMixin:
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                stage_timer=stage_timer,
                             )
 
                         # Cache newly compressed messages (index-aligned diff)
@@ -1119,6 +1127,7 @@ class AnthropicHandlerMixin:
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                stage_timer=stage_timer,
                             )
 
                         if result.messages != messages:
@@ -1151,6 +1160,7 @@ class AnthropicHandlerMixin:
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                    stage_timer=stage_timer,
                                 )
                                 optimized_messages = stable_forwarded_prefix + result.messages
                                 transforms_applied = result.transforms_applied
@@ -2043,6 +2053,8 @@ class AnthropicHandlerMixin:
                         mutation_reasons=body_mutation_tracker.reasons,
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
+                        metrics_stage_path="anthropic_messages",
+                        pre_upstream_ms=stage_timer.summary().get("total_pre_upstream"),
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):

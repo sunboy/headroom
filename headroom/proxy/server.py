@@ -812,6 +812,25 @@ class HeadroomProxy(
             max_workers=_compression_max,
             thread_name_prefix="headroom-compress",
         )
+        # Bounded capacity-reclamation watchdog (fix follow-up to C3): once
+        # ``_compression_leaked_in_flight`` — zombie threads that are
+        # *currently still running* past their asyncio deadline — reaches
+        # this many, the pool has zero healthy slots left (every worker is
+        # pinned on a job whose awaiter already gave up). At that point
+        # ``_maybe_recycle_compression_executor_locked`` swaps in a fresh,
+        # full-capacity ``ThreadPoolExecutor`` so new compression calls are
+        # not queued behind threads that may never return. See
+        # ``_run_compression_in_executor`` and
+        # ``_maybe_recycle_compression_executor_locked`` for the full
+        # mechanism. Defaults to the pool's own size (recycle only once
+        # truly starved); operators can set
+        # ``ProxyConfig.compression_leak_recycle_threshold`` lower to
+        # recycle more eagerly.
+        _recycle_threshold_cfg = config.compression_leak_recycle_threshold
+        self._compression_leak_recycle_threshold: int = max(
+            1,
+            _compression_max if _recycle_threshold_cfg is None else _recycle_threshold_cfg,
+        )
         # Gauge: currently-running compression tasks. Mutated under
         # ``_compression_metrics_lock`` from worker threads + the asyncio
         # event loop.
@@ -825,10 +844,36 @@ class HeadroomProxy(
         self._compression_in_flight_max: int = 0
         self._compression_run_seconds_total: float = 0.0
         self._compression_run_seconds_max: float = 0.0
+        # Counter: total compression attempts submitted to the executor.
+        # The denominator for leak/timeout *rates* — without it,
+        # ``leaked_threads_total`` and ``queue_timeouts_total`` are only
+        # raw counts with no way to tell "2 leaks out of 5 attempts" (an
+        # emergency) from "2 leaks out of 50,000" (background noise).
+        self._compression_total: int = 0
         # Counter: threads that finished AFTER their asyncio future hit the
-        # timeout. Stuck-thread leak indicator.
+        # timeout. Stuck-thread leak indicator. Monotonic lifetime total —
+        # never decremented, including across executor recycles.
         self._compression_leaked_threads: int = 0
+        # Gauge: leaked threads that are STILL RUNNING right now (not yet
+        # finished). Bounded by ``_compression_leak_recycle_threshold`` —
+        # crossing it triggers a recycle, which resets this gauge to 0
+        # (capacity is restored; the old zombies are no longer reachable
+        # from ``self._compression_executor`` and finish in the
+        # background).
+        self._compression_leaked_in_flight: int = 0
+        # Counter: how many times the watchdog has recycled the executor.
+        # A non-zero value is itself an alertable signal — "we ran the
+        # pool dry at least once" — independent of the raw leak count.
+        self._compression_recycles_total: int = 0
         self._compression_metrics_lock = threading.Lock()
+        # Wire the compression-executor gauges/counters into the
+        # Prometheus ``/metrics`` endpoint (previously only in the JSON
+        # ``/stats``/``/health`` payload — see
+        # ``_compression_executor_metrics_snapshot`` below and
+        # ``PrometheusMetrics.set_compression_executor_snapshot_fn``).
+        self.metrics.set_compression_executor_snapshot_fn(
+            self._compression_executor_metrics_snapshot
+        )
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
         # Supports: "anthropic" (direct), "bedrock", "vertex", "litellm-<provider>", or "anyllm"
@@ -1019,11 +1064,89 @@ class HeadroomProxy(
             },
         )
 
+    def _compression_executor_metrics_snapshot(self) -> dict[str, int | float]:
+        """Point-in-time snapshot of the compression-executor gauges and
+        counters, for ``PrometheusMetrics.export()`` (registered via
+        ``set_compression_executor_snapshot_fn`` in ``__init__``).
+
+        Mirrors the fields already surfaced in the JSON ``/stats``/
+        ``/health`` ``runtime.compression_executor`` payload
+        (``_runtime_payload`` below) — this is purely an additional,
+        alertable export of the same numbers, not a replacement.
+        """
+        with self._compression_metrics_lock:
+            return {
+                "compression_total": self._compression_total,
+                "queued": self._compression_queued,
+                "in_flight": self._compression_in_flight,
+                "run_seconds_total": self._compression_run_seconds_total,
+                "queue_wait_seconds_total": self._compression_queue_wait_seconds_total,
+                "queue_timeouts_total": self._compression_queue_timeouts,
+                "leaked_threads_total": self._compression_leaked_threads,
+                "leaked_in_flight": self._compression_leaked_in_flight,
+                "recycles_total": self._compression_recycles_total,
+                "max_workers": self.compression_max_workers,
+            }
+
+    def _maybe_recycle_compression_executor_locked(self) -> None:
+        """Recycle ``self._compression_executor`` if the pool is starved.
+
+        MUST be called while already holding ``_compression_metrics_lock``
+        (constructing a ``ThreadPoolExecutor`` is cheap and non-blocking —
+        it lazily spawns worker threads on first submit — so doing this
+        under the lock is safe).
+
+        Bounded capacity reclamation: ``asyncio.wait_for`` cannot preempt a
+        compression worker that has already started (see
+        ``_run_compression_in_executor``), so a burst of slow/stuck jobs
+        can pin every slot in the pool on zombie threads that may never
+        return — new compression calls then queue forever behind them.
+        Once ``_compression_leaked_in_flight`` (zombies *currently still
+        running*) reaches ``_compression_leak_recycle_threshold``, this
+        swaps in a brand-new, full-capacity ``ThreadPoolExecutor``. New
+        submissions go to the fresh pool; the old pool is not interrupted
+        (Python cannot stop a running thread) — its zombies keep running
+        in the background, still update ``_compression_leaked_threads``/
+        ``_compression_leaked_in_flight`` when they eventually finish (via
+        the closure captured at submission time), and are simply no
+        longer reachable for new work. This bounds concurrently-leaked
+        capacity loss to at most ``_compression_leak_recycle_threshold``
+        slots per pool generation instead of letting it grow unboundedly
+        for the process lifetime.
+        """
+        if self._compression_leaked_in_flight < self._compression_leak_recycle_threshold:
+            return
+        old_executor = self._compression_executor
+        self._compression_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.compression_max_workers,
+            thread_name_prefix="headroom-compress",
+        )
+        self._compression_recycles_total += 1
+        # Capacity is restored — the gauge tracks zombies consuming
+        # *current* pool capacity, not lifetime leak history (that's
+        # ``_compression_leaked_threads``).
+        self._compression_leaked_in_flight = 0
+        logger.warning(
+            "Compression executor recycled: %d threads were leaked and "
+            "concurrently running (threshold=%d). Old pool's zombie "
+            "threads continue in the background; new compression calls "
+            "use a fresh %d-worker pool. recycles_total=%d",
+            self._compression_leak_recycle_threshold,
+            self._compression_leak_recycle_threshold,
+            self.compression_max_workers,
+            self._compression_recycles_total,
+        )
+        try:
+            old_executor.shutdown(wait=False)
+        except Exception:  # pragma: no cover - defensive, shutdown() is not expected to raise
+            logger.debug("Old compression executor shutdown() raised", exc_info=True)
+
     async def _run_compression_in_executor(
         self,
         fn,  # noqa: ANN001 — caller-supplied no-arg sync callable
         *,
         timeout: float,
+        stage_timer: Any | None = None,
     ):
         """Run a synchronous compression callable on the bounded executor
         with cancel-aware metrics.
@@ -1046,9 +1169,17 @@ class HeadroomProxy(
         marking the call timed out on the asyncio side and incrementing
         ``_compression_leaked_threads`` from the worker's ``finally``
         block after it eventually finishes. Jobs that time out before a
-        worker starts are removed from the queued gauge instead. Operators
-        can see leaked-thread rate and queue pressure climbing in
-        ``/stats`` before the pool fills up.
+        worker starts are removed from the queued gauge instead — see the
+        ``TimeoutError`` handler below: ``asyncio.wait_for`` cancels the
+        wrapped future on timeout, and ``concurrent.futures.Future.cancel()``
+        actually succeeds (removing the work item before it ever runs) IF
+        the job had not yet started; ``state["queued"]`` at that point
+        tells us which case happened. Operators can see leaked-thread rate
+        and queue pressure climbing in ``/stats`` and ``/metrics`` before
+        the pool fills up. When enough threads are *concurrently* leaked
+        (``_compression_leak_recycle_threshold``), the executor is
+        recycled — see ``_maybe_recycle_compression_executor_locked`` —
+        so a starved pool does not permanently lose capacity.
 
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
@@ -1058,6 +1189,15 @@ class HeadroomProxy(
             timeout: Wall-clock timeout for the asyncio side. The
                 executor worker keeps running past this (Python limitation
                 — see above), but at least the awaiter unblocks.
+            stage_timer: Optional ``StageTimer`` (see
+                ``headroom.proxy.stage_timer``). When provided and the
+                call does not time out, records the queue-wait duration
+                (time spent waiting for a free worker before the job
+                started) under the ``compression_queue_wait`` stage, in
+                milliseconds — the per-request counterpart to the
+                aggregate ``queue_wait_seconds_total`` gauge. Written from
+                the worker thread but only read by the caller after
+                ``await`` returns, so there is no cross-thread race.
 
         Returns:
             Whatever ``fn()`` returns.
@@ -1069,8 +1209,9 @@ class HeadroomProxy(
         """
         loop = asyncio.get_running_loop()
         queued_at = time.monotonic()
-        state = {"queued": True, "timed_out": False}
+        state = {"queued": True, "timed_out": False, "queue_wait_seconds": None}
         with self._compression_metrics_lock:
+            self._compression_total += 1
             self._compression_queued += 1
             if self._compression_queued > self._compression_queued_max:
                 self._compression_queued_max = self._compression_queued
@@ -1082,6 +1223,7 @@ class HeadroomProxy(
                 if state["queued"]:
                     self._compression_queued -= 1
                     state["queued"] = False
+                state["queue_wait_seconds"] = queue_wait
                 self._compression_queue_wait_seconds_total += queue_wait
                 if queue_wait > self._compression_queue_wait_seconds_max:
                     self._compression_queue_wait_seconds_max = queue_wait
@@ -1099,18 +1241,36 @@ class HeadroomProxy(
                         self._compression_run_seconds_max = elapsed
                     if state["timed_out"]:
                         self._compression_leaked_threads += 1
+                        self._compression_leaked_in_flight = max(
+                            0, self._compression_leaked_in_flight - 1
+                        )
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            result = await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             with self._compression_metrics_lock:
                 state["timed_out"] = True
                 if state["queued"]:
+                    # Cancelled before a worker picked it up — no leak.
                     self._compression_queued -= 1
                     state["queued"] = False
                     self._compression_queue_timeouts += 1
+                else:
+                    # Already running on a worker thread; cancel() was a
+                    # no-op and the thread keeps going. Track it as a
+                    # currently-leaked slot and let the watchdog decide
+                    # whether the pool needs recycling.
+                    self._compression_leaked_in_flight += 1
+                    self._maybe_recycle_compression_executor_locked()
             raise
+        else:
+            if stage_timer is not None and state["queue_wait_seconds"] is not None:
+                with contextlib.suppress(Exception):
+                    stage_timer.record(
+                        "compression_queue_wait", state["queue_wait_seconds"] * 1000.0
+                    )
+            return result
 
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session.
@@ -1988,6 +2148,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Snapshot compression executor metrics under their lock (gauges
         # mutated by worker threads; not safe to read without).
         with proxy._compression_metrics_lock:
+            _comp_total = proxy._compression_total
             _comp_queued = proxy._compression_queued
             _comp_queued_max = proxy._compression_queued_max
             _comp_queue_timeouts = proxy._compression_queue_timeouts
@@ -1998,6 +2159,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_run_total = proxy._compression_run_seconds_total
             _comp_run_max = proxy._compression_run_seconds_max
             _comp_leaked = proxy._compression_leaked_threads
+            _comp_leaked_in_flight = proxy._compression_leaked_in_flight
+            _comp_recycles = proxy._compression_recycles_total
+            _comp_recycle_threshold = proxy._compression_leak_recycle_threshold
         return {
             "anthropic_pre_upstream": {
                 "enabled": proxy.anthropic_pre_upstream_sem is not None,
@@ -2026,6 +2190,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
                 "source": ("auto" if config.compression_max_workers is None else "explicit"),
+                # Denominator for leak/timeout rates: leaked_threads_total /
+                # compression_total, queue_timeouts_total / compression_total.
+                "compression_total": _comp_total,
+                # Bounded capacity-reclamation watchdog (additive — see
+                # HeadroomProxy._maybe_recycle_compression_executor_locked).
+                "leaked_in_flight": _comp_leaked_in_flight,
+                "recycle_threshold": _comp_recycle_threshold,
+                "recycles_total": _comp_recycles,
             },
             "websocket_sessions": {
                 "active_sessions": ws_active_sessions,

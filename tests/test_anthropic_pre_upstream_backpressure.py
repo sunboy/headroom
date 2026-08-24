@@ -191,9 +191,13 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.upstream_enter_times: list[float] = []
         self.upstream_exit_times: list[float] = []
 
-    async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001
+    async def _run_compression_in_executor(self, fn, *, timeout, stage_timer=None):  # noqa: ANN001
         # Mirror of ``HeadroomProxy._run_compression_in_executor`` for the
         # mixin tests. Same metrics semantics; same timeout behavior.
+        # ``stage_timer`` (compression-worker-metrics fix follow-up) is
+        # accepted for signature parity with the real method but not
+        # exercised here — this dummy doesn't model per-request stage
+        # timing, only the C3 executor/leak semantics.
         loop = asyncio.get_running_loop()
         start = time.perf_counter()
         with self._compression_metrics_lock:

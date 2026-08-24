@@ -664,11 +664,38 @@ class StreamingMixin:
         parsed_response: dict[str, Any] | None = None,
         client: str | None = None,
         waste_signals: dict[str, int] | None = None,
+        metrics_stage_path: str | None = None,
+        pre_upstream_ms: float | None = None,
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
 
         outcome_provider = outcome_provider or provider
         total_latency = (time.time() - start_time) * 1000
+
+        # Stage-timing export (Unit 2 follow-up): streaming requests never
+        # run through the caller's ``StageTimer``/``expected_stages`` log
+        # (see ``_stream_response``'s docstring) since that finalizes
+        # before the stream starts. Record the total upstream-bound
+        # duration for THIS request directly, so streaming traffic is not
+        # silently absent from the ``headroom_stage_timing_ms_*`` series.
+        # No-op unless the caller opted in via ``metrics_stage_path``.
+        if metrics_stage_path is not None:
+            metrics = getattr(self, "metrics", None)
+            if metrics is not None and hasattr(metrics, "record_stage_timings"):
+                upstream_total_ms = (
+                    total_latency
+                    if pre_upstream_ms is None
+                    else max(0.0, total_latency - pre_upstream_ms)
+                )
+                try:
+                    await metrics.record_stage_timings(
+                        metrics_stage_path, {"upstream_total": upstream_total_ms}
+                    )
+                except Exception:  # pragma: no cover - defensive, mirrors emit_stage_timings_log
+                    logger.debug(
+                        f"[{request_id}] record_stage_timings failed for upstream_total",
+                        exc_info=True,
+                    )
 
         # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
         # When upstream truncates mid-event (client disconnect, network
@@ -816,8 +843,27 @@ class StreamingMixin:
         memory_request_ctx: Any | None = None,
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
+        metrics_stage_path: str | None = None,
+        pre_upstream_ms: float | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
+
+        ``metrics_stage_path`` / ``pre_upstream_ms`` (both optional,
+        default ``None`` — a no-op for existing callers): when provided,
+        the finalizer records an ``upstream_total`` stage duration via
+        ``self.metrics.record_stage_timings(metrics_stage_path, ...)``
+        once the stream fully completes. Streaming requests never measure
+        ``upstream_connect``/``upstream_first_byte`` in the caller's
+        ``StageTimer`` (the pre-upstream phase finalizes and emits its
+        stage-timing log BEFORE the stream is dispatched, since the
+        pre-upstream semaphore must be released before streaming starts —
+        see ``handlers/anthropic.py``'s ``_finalize_pre_upstream``), so
+        without this, streaming requests contribute nothing to the
+        per-stage Prometheus series for upstream duration even though
+        they are the majority path. ``pre_upstream_ms`` (the caller's
+        already-finalized ``total_pre_upstream`` duration) is subtracted
+        from the full request latency so ``upstream_total`` approximates
+        upstream-only time rather than including pre-upstream work.
 
         Parses SSE events to extract actual usage information from the API response
         for accurate token counting and cost calculation.
@@ -1068,6 +1114,8 @@ class StreamingMixin:
                 original_messages=original_messages,
                 client=client,
                 waste_signals=waste_signals,
+                metrics_stage_path=metrics_stage_path,
+                pre_upstream_ms=pre_upstream_ms,
             )
             return Response(
                 content=error_content,
@@ -1339,6 +1387,8 @@ class StreamingMixin:
                     parsed_response=parsed_response,
                     client=client,
                     waste_signals=waste_signals,
+                    metrics_stage_path=metrics_stage_path,
+                    pre_upstream_ms=pre_upstream_ms,
                 )
 
         return StreamingResponse(
