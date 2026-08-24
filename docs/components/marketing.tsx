@@ -49,9 +49,9 @@ const features: {
   lang?: string;
 }[] = [
   {
-    title: 'Lossless Compression (CCR)',
+    title: 'Reversible Compression (CCR)',
     description:
-      'Compresses aggressively, stores originals, gives the LLM a tool to retrieve full details. Nothing is thrown away.',
+      'Compresses aggressively, stores originals, gives the LLM a tool to retrieve full details — recoverable whenever the marker, store, and retrieval tool are all live.',
     href: '/docs/ccr',
   },
   {

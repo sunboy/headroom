@@ -1,12 +1,12 @@
 ---
 title: Reversible Compression (CCR)
-description: Compress-Cache-Retrieve architecture that makes compression lossless — the LLM can always get the original data back.
+description: Compress-Cache-Retrieve architecture that makes compression recoverable — every drop pairs a stored original with an in-prompt marker, when the marker, store, and retrieval tool are all live.
 ---
 
 Headroom's CCR (Compress-Cache-Retrieve) architecture makes compression **reversible**. When content is compressed, the original data is cached locally. If the LLM needs the full data, it retrieves it instantly.
 
-<Callout type="info" title="Nothing is ever thrown away">
-  Unlike traditional lossy compression, CCR guarantees that every piece of original data remains accessible. You get 70-90% token savings with zero risk of permanent data loss.
+<Callout type="info" title="The recovery guarantee, precisely">
+  Whenever SmartCrusher drops elements from a compressible array (object, string, number, or mixed), it stores the complete original under a hash and emits a `<<ccr:...>>` marker pointing at it — enforced by round-trip tests in CI, not just described here (see [Enforcement](#enforcement-the-tests-that-back-this) below). That marker is a recovery path only while four things hold: `enable_ccr_marker` is on, a CCR store is configured, the `headroom_retrieve` tool is actually available to the model, and the stored original has not passed its TTL. Turn any of those off and the row-drop still happens, but recovery does not — see [Conditions](#conditions-when-recovery-does-and-does-not-work).
 </Callout>
 
 ## The problem with traditional compression
@@ -33,6 +33,18 @@ LLM PROCESSING
   Option B: LLM calls headroom_retrieve(hash=abc123)
             -> Response Handler returns full data automatically
 ```
+
+## Conditions: when recovery does and does not work
+
+The guarantee above is not unconditional — it depends on four things, each of which can lapse independently:
+
+1. **`enable_ccr_marker` is on.** This is the master gate on `SmartCrusherConfig`. When it's `false`, SmartCrusher still drops elements to hit its compression target, but it emits no marker and writes nothing to the store — there is genuinely no recovery path for that drop. This is tested behavior, not a hypothetical: see `enable_ccr_marker_false_suppresses_marker_and_store` and its per-array-type siblings (`string_array_enable_ccr_marker_false_suppresses_marker_and_store`, `number_array_enable_ccr_marker_false_suppresses_marker_and_store`, `mixed_array_enable_ccr_marker_false_suppresses_marker_and_store`) in `crates/headroom-core/src/transforms/smart_crusher/crusher.rs`.
+2. **A CCR store is configured and reachable.** The marker and hash are only useful if something wrote the payload behind them. The row-drop path writes `if let Some(store) = &self.ccr_store { store.put(&h, &canonical); }` — a marker can be emitted with no store attached, in which case the hash points at nothing.
+3. **The `headroom_retrieve` tool is actually injected into the request.** Tool injection is controlled by `--no-ccr-inject-tool` / the `HEADROOM_NO_CCR_INJECT_TOOL` environment variable, and is separately **deferred** whenever `frozen_message_count > 0` — Headroom skips injecting the tool (and the system-instruction hint) on that turn specifically to avoid invalidating the cached prompt prefix. A marker sitting in the prompt is not a recovery path if the model has no tool to act on it.
+
+4. **The stored original has not expired.** CCR entries carry a TTL — 1800 seconds (30 minutes) by default — after which they are purged from the store. A marker embedded in an earlier turn outlives the payload it points at, so in a session that runs longer than the TTL, a retrieval attempt against an old marker can miss. This is the condition most likely to bite in practice; see [Retention](#retention) to tune it.
+
+The four are independent: a store with no injected tool just means the model can't ask; an injected tool with no store means the hash resolves to nothing; the marker gate off means neither exists in the first place; and an expired entry means the hash was valid once but no longer resolves.
 
 ## Phase 1: Compression Store
 
@@ -62,6 +74,18 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
 ```
 
 The LLM sees this tool alongside your application's tools and can call it whenever the compressed data is insufficient.
+
+## How each array type surfaces its marker
+
+SmartCrusher classifies every JSON array it compresses, and the four crushable types each surface their CCR marker in a different shape:
+
+| Array type | Marker shape | Where |
+|---|---|---|
+| Object arrays (array of dicts) | A trailing sentinel object: `{"_ccr_dropped": "<<ccr:HASH N_rows_offloaded>>"}` appended as the last element | `process_value`, `DictArray` branch |
+| String / number / mixed arrays | A trailing **bare string** element: `<<ccr:HASH N_rows_offloaded>>` | `process_value`'s `StringArray`/`NumberArray` branches and `crush_mixed_array`, via the shared `offload_dropped_for_ccr` helper |
+| Opaque blob strings (long base64, HTML, long text) | An **in-place substitution** of the whole string value: `<<ccr:HASH,KIND,SIZE>>` | `process_string` (and the document walker's equivalent path) |
+
+Object arrays get a wrapper object so downstream consumers iterating with `x.get(...)` keep working. String/number/mixed arrays use a bare marker string instead — wrapping it in an object would break the array's homogeneity, and a plain string is the cheapest way to carry it without disturbing the type. Opaque blobs aren't array elements at all; the marker replaces the oversized string value in place. All three formats share the `<<ccr:` / `>>` bracketing, so a single predicate (`is_ccr_dropped_marker`) can detect a row-drop marker regardless of which branch produced it.
 
 ## Phase 3: Response Handler
 
@@ -164,8 +188,12 @@ response = client.chat.completions.create(
 
 ## Retention
 
-Proxy CCR originals are kept for 300 seconds by default. For longer autonomous
-agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the proxy:
+Proxy CCR originals are kept for 1800 seconds (30 minutes) by default
+(`DEFAULT_CCR_TTL_SECONDS` in `headroom/cache/compression_store.py`, matched by
+`DEFAULT_TTL` in the Rust store). Once an entry's TTL lapses it is purged, and a
+marker still sitting in an older turn's context will no longer resolve. For
+longer autonomous agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the
+proxy:
 
 ```bash
 HEADROOM_CCR_TTL_SECONDS=7200 headroom proxy
@@ -185,12 +213,31 @@ Check the effective setting at `/v1/retrieve/stats` under
 | **SmartCrusher** | JSON arrays (tool outputs) | Stores original array, marker includes hash |
 | **ContentRouter** | Code, logs, search results, text | Stores original content by strategy |
 
+## Enforcement: the tests that back this
+
+The recovery guarantee isn't just prose — it's an executable invariant checked in CI. Each crushable array type has a round-trip test in `crates/headroom-core/src/transforms/smart_crusher/crusher.rs` that drops a 200-element array, extracts the hash from the emitted marker, reads the payload back out of the CCR store, and asserts the deserialized result equals the complete original input (not just a row count):
+
+- `string_array_drop_offloads_full_original_to_ccr`
+- `number_array_drop_offloads_full_original_to_ccr`
+- `mixed_array_drop_offloads_full_original_to_ccr`
+- `dict_array_drop_offloads_full_original_to_ccr_round_trip`
+
+And the flip side — that turning `enable_ccr_marker` off suppresses both the marker text and the store write, for every array type, so the docs' conditions above aren't just claimed either:
+
+- `enable_ccr_marker_false_suppresses_marker_and_store`
+- `string_array_enable_ccr_marker_false_suppresses_marker_and_store`
+- `number_array_enable_ccr_marker_false_suppresses_marker_and_store`
+- `mixed_array_enable_ccr_marker_false_suppresses_marker_and_store`
+- `dict_array_enable_ccr_marker_false_suppresses_marker_and_store_via_process_value`
+
+If a future change breaks the store write, the marker format, or the gate, one of these tests fails — the guarantee stated at the top of this page is tied to something that actually runs, not a claim that can silently drift out of sync with the code.
+
 ## Why CCR matters
 
 | Approach | Risk | Savings |
 |---|---|---|
 | No compression | None | 0% |
 | Traditional compression | Data loss | 70-90% |
-| CCR compression | None (reversible) | 70-90% |
+| CCR compression (marker + store + tool all live) | Low — drops are recoverable | 70-90% |
 
-CCR gives you the savings of aggressive compression with zero risk. The LLM can always retrieve the original data if needed.
+CCR gives you the savings of aggressive compression while keeping every drop recoverable, as long as the marker, the store, and the retrieval tool are all in place — see [Conditions](#conditions-when-recovery-does-and-does-not-work) above. Turn any of those off deliberately (e.g. `--no-ccr-inject-tool`, or `enable_ccr_marker=false`) and you're back to ordinary lossy compression for that request.

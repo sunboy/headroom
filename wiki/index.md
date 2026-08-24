@@ -317,8 +317,8 @@ graph LR
 <div class="grid-container" markdown>
 
 <div class="grid-item" markdown>
-### Lossless Compression (CCR)
-Compresses aggressively, stores originals, gives the LLM a tool to retrieve full details. Nothing is thrown away.
+### Reversible Compression (CCR)
+Compresses aggressively, stores originals, gives the LLM a tool to retrieve full details — recoverable whenever the marker, store, and retrieval tool are all live.
 [Learn more &rarr;](ccr.md)
 </div>
 

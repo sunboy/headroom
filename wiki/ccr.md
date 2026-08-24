@@ -150,9 +150,9 @@ headroom proxy --no-ccr-expansion
 |----------|------|---------|
 | No compression | None | 0% |
 | Traditional compression | Data loss | 70-90% |
-| CCR compression | None (reversible) | 70-90% |
+| CCR compression (marker + store + tool all live) | Low — drops are recoverable | 70-90% |
 
-CCR gives you the savings of aggressive compression with zero risk — the LLM can always retrieve the original data if needed.
+CCR gives you the savings of aggressive compression while keeping every drop recoverable — dropped elements are hashed, stored, and pointed at by an in-prompt marker, and the LLM can retrieve them via `headroom_retrieve`. That recovery path requires the marker gate, the CCR store, and the retrieval tool to all be enabled; see the [full CCR guarantee and its conditions](../docs/content/docs/ccr.mdx) for the details and the tests that enforce them.
 
 ## Demo
 
