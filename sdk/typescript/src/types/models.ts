@@ -113,7 +113,12 @@ export interface SessionStats {
   totalTokensAfter: number;
   totalTokensSaved: number;
   averageCompressionRatio: number;
+  /** Union of providerCacheHits and responseCacheHits. Kept for compatibility. */
   cacheHits: number;
+  /** Requests where the upstream provider reported a prompt-cache read. */
+  providerCacheHits: number;
+  /** Requests served entirely from Headroom's own response cache. */
+  responseCacheHits: number;
   byMode: Record<string, { requests: number; tokensSaved: number }>;
 }
 

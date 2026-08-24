@@ -177,6 +177,60 @@ describe("HeadroomClient.getSummary()", () => {
   });
 });
 
+describe("HeadroomClient.getStats()", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("maps the new granular cache-hit fields alongside the legacy union", async () => {
+    // P1 metrics-split fix: /stats now reports provider_cache_hits and
+    // response_cache_hits as siblings of the pre-existing cached union.
+    mockFetch.mockResolvedValue(
+      jsonResponse({
+        requests: {
+          total: 100,
+          cached: 12,
+          provider_cache_hits: 9,
+          response_cache_hits: 3,
+        },
+        tokens: {
+          total_before_compression: 100000,
+          saved: 40000,
+          savings_percent: 40,
+        },
+      }),
+    );
+
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+    const stats = await client.getStats();
+
+    expect(stats.totalRequests).toBe(100);
+    expect(stats.totalTokensSaved).toBe(40000);
+    // Legacy field unchanged in meaning.
+    expect(stats.cacheHits).toBe(12);
+    // New granular siblings.
+    expect(stats.providerCacheHits).toBe(9);
+    expect(stats.responseCacheHits).toBe(3);
+    expect(stats.providerCacheHits + stats.responseCacheHits).toBe(stats.cacheHits);
+  });
+
+  it("defaults the new granular fields to 0 against an older proxy response", async () => {
+    // Backwards compatibility: a proxy that hasn't been upgraded yet
+    // won't send provider_cache_hits / response_cache_hits at all.
+    mockFetch.mockResolvedValue(
+      jsonResponse({
+        requests: { total: 5, cached: 2 },
+        tokens: { total_before_compression: 1000, saved: 200, savings_percent: 20 },
+      }),
+    );
+
+    const client = new HeadroomClient({ baseUrl: "http://test:8787" });
+    const stats = await client.getStats();
+
+    expect(stats.cacheHits).toBe(2);
+    expect(stats.providerCacheHits).toBe(0);
+    expect(stats.responseCacheHits).toBe(0);
+  });
+});
+
 describe("HeadroomClient.validateSetup()", () => {
   beforeEach(() => vi.clearAllMocks());
 

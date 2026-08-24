@@ -483,3 +483,74 @@ def test_responses_memory_tools_do_not_change_unrelated_requests() -> None:
         is False
     )
     assert "store" not in default_store_payload
+
+
+def test_tool_schema_savings_breakdown_is_populated_and_distinct() -> None:
+    """P1 metrics-split fix: tool-schema compaction's contribution to
+    ``tokens_saved`` must be independently observable via the optional
+    ``savings_breakdown`` out-param, distinct from generic content
+    compression. When tool-schema compaction is the *only* thing that ran
+    (no live text units), ``savings_breakdown["tool_schema_tokens_saved"]``
+    should equal the full ``tokens_saved`` returned — proving the
+    breakdown isn't silently zero or double-counted."""
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+
+    verbose = " ".join(["Use this tool to read a file from the workspace."] * 40)
+    payload: dict[str, Any] = {
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "title": "Read File",
+                "description": verbose,
+                "parameters": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "ReadFileParameters",
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "title": "Path",
+                            "type": "string",
+                            "examples": ["src/main.py"],
+                        }
+                    },
+                    "required": ["path"],
+                },
+            }
+        ],
+    }
+
+    savings_breakdown: dict[str, int] = {}
+    (
+        _working,
+        modified,
+        tokens_saved,
+        transforms,
+        _reason,
+        _before,
+        _after,
+        _attempted,
+    ) = handler._compress_openai_responses_payload(
+        payload,
+        model="gpt-5",
+        request_id="req_tool_schema_breakdown",
+        savings_breakdown=savings_breakdown,
+    )
+
+    assert modified is True
+    assert "openai:responses:tool_schema_compaction" in transforms
+    assert tokens_saved > 0
+    # The breakdown must exist, be positive, and — since no live text
+    # units were compressed in this pass — equal the combined total.
+    assert savings_breakdown.get("tool_schema_tokens_saved", 0) > 0
+    assert savings_breakdown["tool_schema_tokens_saved"] == tokens_saved
+
+    # Backwards compatibility: omitting the out-param entirely (as every
+    # pre-fix call site does) must not change behavior or raise.
+    savings_breakdown_omitted = handler._compress_openai_responses_payload(
+        dict(payload),
+        model="gpt-5",
+        request_id="req_tool_schema_breakdown_no_out_param",
+    )
+    assert savings_breakdown_omitted[2] == tokens_saved

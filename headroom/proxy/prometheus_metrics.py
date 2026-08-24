@@ -74,7 +74,19 @@ class PrometheusMetrics:
         self.requests_by_model: dict[str, int] = defaultdict(int)
         # Populated via X-Headroom-Stack header (TS SDK adapters, etc.)
         self.requests_by_stack: dict[str, int] = defaultdict(int)
+        # ``requests_cached`` is the pre-existing, unlabeled union of the
+        # two concepts below: EITHER the upstream provider served the
+        # request from its own prompt cache (`provider_cache_hit`) OR
+        # Headroom's own semantic response cache served it without
+        # reaching the provider at all (`response_cache_hit`). The two
+        # new counters are additive siblings — always incremented
+        # alongside, never instead of, ``requests_cached`` — so a
+        # provider-cache-only request and a response-cache-only request
+        # both bump the same union total but only one of the two
+        # granular counters.
         self.requests_cached = 0
+        self.requests_provider_cache_hit = 0
+        self.requests_response_cache_hit = 0
         self.requests_rate_limited = 0
         self.requests_failed = 0
         self.inbound_requests_total = 0
@@ -87,6 +99,19 @@ class PrometheusMetrics:
         self.tokens_input_total = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
+        # ``tool_schema_tokens_saved_total`` is a subset already folded
+        # into ``tokens_saved_total`` above (never subtract it back out).
+        # It breaks out how much of the combined compression total came
+        # specifically from OpenAI Responses tool-schema compaction, vs.
+        # generic content compression — previously only visible as a
+        # string tag in `transforms_applied` with no numeric breakdown.
+        self.tool_schema_tokens_saved_total = 0
+        # ``response_cache_tokens_saved_total`` is tracked separately and
+        # is NOT folded into ``tokens_saved_total`` — a response-cache
+        # hit never enters the compression pipeline, so counting it
+        # there would be a breaking semantic change to what
+        # ``tokens_saved_total`` / ``savings.total_tokens`` mean today.
+        self.response_cache_tokens_saved_total = 0
         # Sum of tokens we actually attempted to compress across the
         # session: extracted units that passed all gates + tool-schema
         # tokens we ran compaction against. Excludes prefix-frozen
@@ -256,6 +281,8 @@ class PrometheusMetrics:
             self.requests_by_model.clear()
             self.requests_by_stack.clear()
             self.requests_cached = 0
+            self.requests_provider_cache_hit = 0
+            self.requests_response_cache_hit = 0
             self.requests_rate_limited = 0
             self.requests_failed = 0
             self.inbound_requests_total = 0
@@ -268,6 +295,8 @@ class PrometheusMetrics:
             self.tokens_input_total = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
+            self.tool_schema_tokens_saved_total = 0
+            self.response_cache_tokens_saved_total = 0
             self.attempted_input_tokens_total = 0
 
             self.compressions_by_strategy.clear()
@@ -563,6 +592,19 @@ class PrometheusMetrics:
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
+        # Granular siblings of ``cached`` (see the field docstring on
+        # ``self.requests_cached``). Both optional and independent of
+        # ``cached`` — callers that don't know about the split can keep
+        # passing only ``cached`` and these simply stay False, matching
+        # pre-fix behaviour exactly.
+        provider_cache_hit: bool = False,
+        response_cache_hit: bool = False,
+        # Breakdown of ``tokens_saved`` (tool_schema_tokens_saved, folded
+        # into ``tokens_saved_total`` — never added twice) and a fully
+        # separate response-cache savings figure (NOT folded into
+        # ``tokens_saved_total``; see the field docstring above).
+        tool_schema_tokens_saved: int = 0,
+        response_cache_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
     ):
@@ -574,10 +616,19 @@ class PrometheusMetrics:
 
             if cached:
                 self.requests_cached += 1
+            if provider_cache_hit:
+                self.requests_provider_cache_hit += 1
+            if response_cache_hit:
+                self.requests_response_cache_hit += 1
 
             self.tokens_input_total += input_tokens
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
+            # Subset already counted in tokens_saved_total above — not
+            # added again.
+            self.tool_schema_tokens_saved_total += max(0, int(tool_schema_tokens_saved))
+            # NOT folded into tokens_saved_total — see field docstring.
+            self.response_cache_tokens_saved_total += max(0, int(response_cache_tokens_saved))
             # See the attribute definition for why this is the right
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
@@ -810,8 +861,38 @@ class PrometheusMetrics:
                 lines,
                 name="headroom_requests_cached_total",
                 metric_type="counter",
-                help_text="Cached request count",
+                help_text=(
+                    "Cached request count. Union of "
+                    "headroom_requests_provider_cache_hit_total (upstream prompt-cache "
+                    "read) and headroom_requests_response_cache_hit_total (served from "
+                    "Headroom's own response cache without reaching the provider) — "
+                    "see those two metrics to distinguish which kind of cache hit "
+                    "this was."
+                ),
                 value=self.requests_cached,
+            )
+            _append_metric(
+                lines,
+                name="headroom_requests_provider_cache_hit_total",
+                metric_type="counter",
+                help_text=(
+                    "Requests where the upstream provider reported a prompt-cache "
+                    "read (cache_read_tokens > 0). A subset of "
+                    "headroom_requests_cached_total; provider-native caching "
+                    "economics, not a Headroom-side effect."
+                ),
+                value=self.requests_provider_cache_hit,
+            )
+            _append_metric(
+                lines,
+                name="headroom_requests_response_cache_hit_total",
+                metric_type="counter",
+                help_text=(
+                    "Requests served entirely from Headroom's own response cache "
+                    "(the provider was never called). A subset of "
+                    "headroom_requests_cached_total."
+                ),
+                value=self.requests_response_cache_hit,
             )
             _append_metric(
                 lines,
@@ -868,6 +949,30 @@ class PrometheusMetrics:
                 metric_type="counter",
                 help_text="Tokens saved by optimization",
                 value=self.tokens_saved_total,
+            )
+            _append_metric(
+                lines,
+                name="headroom_tool_schema_tokens_saved_total",
+                metric_type="counter",
+                help_text=(
+                    "Tokens saved specifically by OpenAI Responses tool-schema "
+                    "compaction/deferral. Already included in "
+                    "headroom_tokens_saved_total — not an additional total."
+                ),
+                value=self.tool_schema_tokens_saved_total,
+            )
+            _append_metric(
+                lines,
+                name="headroom_response_cache_tokens_saved_total",
+                metric_type="counter",
+                help_text=(
+                    "Tokens saved by requests served from Headroom's own response "
+                    "cache. NOT included in headroom_tokens_saved_total — a "
+                    "response-cache hit never reaches the compression pipeline, so "
+                    "folding this in would change what headroom_tokens_saved_total "
+                    "means."
+                ),
+                value=self.response_cache_tokens_saved_total,
             )
             # NOTE: per-strategy compression breakdown is tracked
             # internally on `self.compressions_by_strategy` and

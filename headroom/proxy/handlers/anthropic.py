@@ -823,6 +823,14 @@ class AnthropicHandlerMixin:
                             tokens_saved=0,
                             attempted_input_tokens=0,
                             from_response_cache=True,
+                            # ``tokens_saved`` above deliberately stays 0
+                            # (this request never entered the compression
+                            # pipeline — changing it would alter
+                            # tokens_saved_total). This sibling field
+                            # carries the response-cache savings that
+                            # were previously tracked on the CacheEntry
+                            # but never surfaced anywhere.
+                            response_cache_tokens_saved=cached.tokens_saved_per_hit,
                             total_latency_ms=optimization_latency,
                             overhead_ms=optimization_latency,
                             num_messages=len(messages),

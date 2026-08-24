@@ -56,6 +56,78 @@ def test_cache_hit_is_derived_not_stored() -> None:
     assert _outcome(cache_read_tokens=500).cache_hit is True
 
 
+def test_cache_hit_true_via_response_cache_with_zero_read_tokens() -> None:
+    """Locks in backwards compatibility for the P1 metrics-split fix:
+    a pure Headroom response-cache hit (``from_response_cache=True``,
+    ``cache_read_tokens=0`` — the provider was never even called) must
+    still make the union ``cache_hit`` True, exactly as before the
+    granular ``provider_cache_hit`` / ``response_cache_hit`` signals were
+    added. Pre-fix, ``from_response_cache`` was never exercised in this
+    file at all — that gap in coverage is part of why the two concepts
+    stayed collapsed with no test protecting the union behaviour."""
+    o = _outcome(cache_read_tokens=0, from_response_cache=True)
+    assert o.cache_hit is True
+
+
+def test_granular_cache_signals_independently_correct() -> None:
+    """The two new granular signals (what the funnel derives and passes
+    to Prometheus as ``provider_cache_hit`` / ``response_cache_hit``)
+    must disagree with each other and with the union exactly where they
+    should — this is the whole point of splitting them apart."""
+    # Provider cache read only: provider signal true, response signal
+    # false, union true.
+    o = _outcome(cache_read_tokens=50, from_response_cache=False)
+    assert (o.cache_read_tokens > 0) is True
+    assert o.from_response_cache is False
+    assert o.cache_hit is True
+
+    # Response cache only: provider signal false, response signal true,
+    # union true.
+    o = _outcome(cache_read_tokens=0, from_response_cache=True)
+    assert (o.cache_read_tokens > 0) is False
+    assert o.from_response_cache is True
+    assert o.cache_hit is True
+
+    # Neither: both false, union false.
+    o = _outcome(cache_read_tokens=0, from_response_cache=False)
+    assert (o.cache_read_tokens > 0) is False
+    assert o.from_response_cache is False
+    assert o.cache_hit is False
+
+    # Both at once (pathological but should never crash): both signals
+    # true, union true.
+    o = _outcome(cache_read_tokens=10, from_response_cache=True)
+    assert (o.cache_read_tokens > 0) is True
+    assert o.from_response_cache is True
+    assert o.cache_hit is True
+
+
+def test_response_cache_tokens_saved_defaults_to_zero_and_is_independent() -> None:
+    """``response_cache_tokens_saved`` is a sibling field to ``tokens_saved``
+    (which stays 0 on a response-cache hit) — it must default to 0 and be
+    settable independently without disturbing ``tokens_saved`` or
+    ``savings_pct``."""
+    o = _outcome()
+    assert o.response_cache_tokens_saved == 0
+
+    o = _outcome(tokens_saved=0, response_cache_tokens_saved=450, from_response_cache=True)
+    assert o.tokens_saved == 0  # unchanged — this is the field that must NOT move
+    assert o.response_cache_tokens_saved == 450
+
+
+def test_tool_schema_tokens_saved_defaults_to_zero_and_is_independent() -> None:
+    """``tool_schema_tokens_saved`` is a subset of ``tokens_saved`` (already
+    folded in) surfaced separately — it must default to 0 and be
+    distinguishable from generic compression savings."""
+    o = _outcome()
+    assert o.tool_schema_tokens_saved == 0
+
+    o = _outcome(tokens_saved=700, tool_schema_tokens_saved=120)
+    assert o.tokens_saved == 700  # combined total unchanged
+    assert o.tool_schema_tokens_saved == 120
+    assert o.tool_schema_tokens_saved < o.tokens_saved
+
+
 def test_cache_hit_pct_handles_zero_denominator() -> None:
     """No reads + no writes is a no-cache request, not a 0%-hit cache request.
     Returning 0 here is correct as long as dashboards distinguish via the
@@ -263,6 +335,36 @@ async def test_funnel_calls_metrics_with_full_kwargs() -> None:
     assert kwargs["cache_write_1h_tokens"] == 50
     assert kwargs["uncached_input_tokens"] == 0
     assert kwargs["attempted_input_tokens"] == 800
+    # Granular cache-hit siblings: derived, not stored on the outcome —
+    # provider read > 0 here, no response-cache hit.
+    assert kwargs["provider_cache_hit"] is True
+    assert kwargs["response_cache_hit"] is False
+    # Neither tool-schema nor response-cache savings were set on this
+    # outcome — both siblings default to 0 through the funnel.
+    assert kwargs["tool_schema_tokens_saved"] == 0
+    assert kwargs["response_cache_tokens_saved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_funnel_passes_granular_cache_and_savings_breakdown_fields() -> None:
+    """The funnel must forward the new granular signals to
+    ``PrometheusMetrics.record_request`` for a response-cache-hit-shaped
+    outcome, independently of the union ``cached`` boolean."""
+    h = _FunnelHarness()
+    o = _outcome(
+        cache_read_tokens=0,
+        from_response_cache=True,
+        response_cache_tokens_saved=333,
+        tool_schema_tokens_saved=44,
+    )
+    await h._record_request_outcome(o)
+
+    kwargs = h.metrics.record_request.await_args.kwargs
+    assert kwargs["cached"] is True  # union: response-cache hit counts
+    assert kwargs["provider_cache_hit"] is False
+    assert kwargs["response_cache_hit"] is True
+    assert kwargs["response_cache_tokens_saved"] == 333
+    assert kwargs["tool_schema_tokens_saved"] == 44
 
 
 @pytest.mark.asyncio
