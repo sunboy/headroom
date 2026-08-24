@@ -179,6 +179,16 @@ def test_content_router_protects_instruction_roles_but_compresses_tool_outputs()
         {"role": "system", "content": "system instructions " * 120},
         {"role": "developer", "content": "developer instructions " * 120},
         {"role": "user", "content": "user prompt " * 120},
+        # A resolvable tool_calls pairing (non-excluded tool) is required so
+        # this exercises normal tool-output compression rather than the
+        # fail-closed unresolved-tool_call_id protection.
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}
+            ],
+        },
         {"role": "tool", "tool_call_id": "call_1", "content": tool_text},
     ]
 
@@ -187,7 +197,7 @@ def test_content_router_protects_instruction_roles_but_compresses_tool_outputs()
     assert result.messages[0]["content"] == messages[0]["content"]
     assert result.messages[1]["content"] == messages[1]["content"]
     assert result.messages[2]["content"] == messages[2]["content"]
-    assert result.messages[3]["content"] == "COMPRESSED"
+    assert result.messages[4]["content"] == "COMPRESSED"
     assert calls == [tool_text]
 
 

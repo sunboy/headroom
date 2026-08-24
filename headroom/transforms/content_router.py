@@ -2578,6 +2578,22 @@ class ContentRouter(Transform):
                     # Old excluded-tool output — fall through to compression
                     # (the LLM is unlikely to need exact content from this far back,
                     # and CCR provides retrieval if it does)
+                elif tool_call_id and tool_call_id not in tool_name_map:
+                    # Fail closed: tool_call_id was supplied but has no
+                    # matching tool_calls entry in any assistant message, so
+                    # we cannot establish provenance (malformed/truncated
+                    # transcript, id collision, or the pairing tool_calls
+                    # block is outside the window). Compressing here would
+                    # apply generic bias=1.0 to a tool result whose safety is
+                    # unknown — protect it instead of guessing. A message
+                    # with NO id at all never carried a resolvable identity
+                    # to begin with (never eligible for exclusion either) so
+                    # it keeps its long-standing default-bias treatment.
+                    result_slots[i] = message
+                    transforms_applied.append("router:unresolved:tool_id")
+                    route_counts.setdefault("unresolved_tool_id", 0)
+                    route_counts["unresolved_tool_id"] += 1
+                    continue
                 # Look up tool-specific compression bias for OpenAI tool messages
                 tool_name = tool_name_map.get(tool_call_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
@@ -2992,6 +3008,7 @@ class ContentRouter(Transform):
             if block_type == "tool_result":
                 # Check if tool is excluded from compression
                 tool_use_id = block.get("tool_use_id", "")
+                resolved_tool_name_map = tool_name_map or {}
                 if tool_use_id in excluded_tool_ids:
                     if messages_from_end <= read_protection_window:
                         # Recent — protect as before
@@ -3001,9 +3018,26 @@ class ContentRouter(Transform):
                             route_counts["excluded_tool"] += 1
                         continue
                     # Old excluded-tool output — fall through to compression
+                elif tool_use_id and tool_use_id not in resolved_tool_name_map:
+                    # Fail closed: tool_use_id was supplied but has no
+                    # matching tool_use block in any assistant message, so we
+                    # cannot establish provenance (malformed/truncated
+                    # transcript, id collision, or the pairing tool_use block
+                    # is outside the window). Compressing here would apply
+                    # generic bias=1.0 to a tool result whose safety is
+                    # unknown — protect it instead of guessing. A block with
+                    # NO id at all never carried a resolvable identity to
+                    # begin with (never eligible for exclusion either) so it
+                    # keeps its long-standing default-bias treatment.
+                    new_blocks.append(block)
+                    transforms_applied.append("router:unresolved:tool_id")
+                    if route_counts is not None:
+                        route_counts.setdefault("unresolved_tool_id", 0)
+                        route_counts["unresolved_tool_id"] += 1
+                    continue
 
                 # Look up tool-specific compression bias
-                tool_name = (tool_name_map or {}).get(tool_use_id, "")
+                tool_name = resolved_tool_name_map.get(tool_use_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
                 tool_content = block.get("content", "")

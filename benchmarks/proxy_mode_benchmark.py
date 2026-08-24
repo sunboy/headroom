@@ -84,6 +84,17 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
                     "content": f"Analyze tool output turn {t} and summarize anomalies.",
                 },
                 {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"tool-{t}",
+                            "name": "Bash",
+                            "input": {"command": "check-status"},
+                        }
+                    ],
+                },
+                {
                     "role": "user",
                     "content": [
                         {
@@ -102,6 +113,17 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
             {
                 "role": "user",
                 "content": f"Analyze tool output turn {turn} and summarize anomalies.",
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": f"tool-{turn}",
+                        "name": "Bash",
+                        "input": {"command": "check-status"},
+                    }
+                ],
             },
             {
                 "role": "user",

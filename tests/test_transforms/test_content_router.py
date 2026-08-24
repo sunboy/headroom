@@ -170,6 +170,20 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
         for i in range(160)
     )
     messages = [
+        # A resolvable tool_use pairing (non-excluded tool) is required so this
+        # exercises the kompress routing path rather than the fail-closed
+        # unresolved-tool_use_id protection (see TestFailClosedOnUnresolvedToolId).
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_search_1",
+                    "name": "Bash",
+                    "input": {"command": "grep -r search ."},
+                }
+            ],
+        },
         {
             "role": "user",
             "content": [
@@ -179,7 +193,7 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
                     "content": tool_content,
                 }
             ],
-        }
+        },
     ]
 
     result = router.apply(
@@ -192,8 +206,8 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
         read_protection_window=0,
     )
 
-    assert result.messages[0]["content"][0]["content"] != tool_content
-    assert result.transforms_applied == ["router:tool_result:kompress"]
+    assert result.messages[1]["content"][0]["content"] != tool_content
+    assert "router:tool_result:kompress" in result.transforms_applied
     assert captured["target_ratio"] == 0.10
 
 
@@ -971,6 +985,218 @@ class TestExcludeTools:
             assert tool not in DEFAULT_EXCLUDE_TOOLS, (
                 f"{tool} should NOT be in DEFAULT_EXCLUDE_TOOLS"
             )
+
+
+# =============================================================================
+# TestFailClosedOnUnresolvedToolId
+# =============================================================================
+
+
+class TestFailClosedOnUnresolvedToolId:
+    """A tool_result/tool block whose tool_use_id (Anthropic) or
+    tool_call_id (OpenAI) cannot be matched to any tool_use/tool_calls
+    entry in the conversation must fail CLOSED — protected like an
+    excluded tool — instead of falling through to generic compression
+    with bias=1.0.
+
+    Pairing can legitimately fail on a malformed transcript, a truncated
+    assistant turn, an id collision, or a tool_result whose tool_use sits
+    outside the compression window. In every one of those cases we know
+    least about the content, so guessing "safe to compress" is wrong.
+    """
+
+    @staticmethod
+    def _make_fake_kompress(monkeypatch, router):
+        """A deterministic Kompress stand-in. If fail-closed protection
+        regresses and this ends up being called for an unresolved id, the
+        test fails loudly rather than silently passing on a lucky ratio.
+        """
+
+        class FakeKompress:
+            def is_ready(self) -> bool:
+                return True
+
+            def ensure_background_load(self) -> None:
+                pass
+
+            def compress(self, content, **kwargs):
+                compressed = " ".join(content.split()[:5])
+                return SimpleNamespace(compressed=compressed, compressed_tokens=5)
+
+        monkeypatch.setattr(router, "_get_kompress", lambda: FakeKompress())
+
+    def test_anthropic_unresolved_tool_use_id_is_protected(self, router, tokenizer, monkeypatch):
+        """tool_result with a tool_use_id that has no matching tool_use
+        anywhere in the conversation is returned byte-for-byte unmodified."""
+        self._make_fake_kompress(monkeypatch, router)
+
+        tool_content = generate_json_data(100)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_orphan_1",  # no matching tool_use anywhere
+                        "content": tool_content,
+                    }
+                ],
+            }
+        ]
+
+        result = router.apply(
+            messages,
+            tokenizer,
+            force_kompress=True,
+            target_ratio=0.10,
+            compress_user_messages=True,
+            min_tokens_to_compress=10,
+            read_protection_window=0,
+        )
+
+        assert result.messages[0]["content"][0]["content"] == tool_content
+        assert "router:unresolved:tool_id" in result.transforms_applied
+        assert "router:tool_result:kompress" not in result.transforms_applied
+        assert "router:excluded:tool" not in result.transforms_applied
+
+    def test_openai_unresolved_tool_call_id_is_protected(self, router, tokenizer, monkeypatch):
+        """role="tool" message with a tool_call_id that has no matching
+        tool_calls entry anywhere in the conversation is left unmodified."""
+        self._make_fake_kompress(monkeypatch, router)
+
+        tool_content = generate_json_data(100)
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_orphan_1",  # no matching tool_calls entry
+                "content": tool_content,
+            }
+        ]
+
+        result = router.apply(
+            messages,
+            tokenizer,
+            force_kompress=True,
+            target_ratio=0.10,
+            min_tokens_to_compress=10,
+            read_protection_window=0,
+        )
+
+        assert result.messages[0]["content"] == tool_content
+        assert "router:unresolved:tool_id" in result.transforms_applied
+        assert "router:excluded:tool" not in result.transforms_applied
+
+    def test_unresolved_tool_id_counter_increments(self, router, tokenizer):
+        """route_counts (forwarded to the observer for /stats) records
+        unresolved-pairing events so operators can see how often
+        classification fails in real traffic."""
+
+        captured: dict[str, dict[str, int]] = {}
+
+        class FakeObserver:
+            def record_router_route_counts(self, route_counts: dict[str, int]) -> None:
+                captured["route_counts"] = dict(route_counts)
+
+        router._observer = FakeObserver()
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_orphan_2",
+                        "content": generate_json_data(100),
+                    }
+                ],
+            }
+        ]
+
+        router.apply(messages, tokenizer, compress_user_messages=True, read_protection_window=0)
+
+        assert captured.get("route_counts", {}).get("unresolved_tool_id", 0) >= 1
+
+    def test_resolved_non_excluded_tool_still_compressed(self, router, tokenizer, monkeypatch):
+        """Control: a tool_result whose tool_use_id DOES resolve to a
+        non-excluded tool (Bash) is still compressed as before. This is the
+        regression guard proving the fail-closed fix did not turn off
+        compression generally."""
+        self._make_fake_kompress(monkeypatch, router)
+
+        tool_content = " ".join(
+            f'{{"file":"src/module_{i}.py","line":{i},"text":"repeated search payload"}}'
+            for i in range(160)
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bash_1",
+                        "name": "Bash",
+                        "input": {"command": "grep -r search ."},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_bash_1",
+                        "content": tool_content,
+                    }
+                ],
+            },
+        ]
+
+        result = router.apply(
+            messages,
+            tokenizer,
+            force_kompress=True,
+            target_ratio=0.10,
+            compress_user_messages=True,
+            min_tokens_to_compress=10,
+            read_protection_window=0,
+        )
+
+        assert result.messages[1]["content"][0]["content"] != tool_content
+        assert "router:tool_result:kompress" in result.transforms_applied
+        assert "router:unresolved:tool_id" not in result.transforms_applied
+        assert "router:excluded:tool" not in result.transforms_applied
+
+    def test_resolved_excluded_tool_still_protected(self, tokenizer):
+        """Control: a tool_result whose tool_use_id DOES resolve to an
+        excluded tool (Read) is still protected as before — the fail-closed
+        path for unresolved ids must not interfere with normal exclusion."""
+        config = ContentRouterConfig(min_section_tokens=10)
+        router = ContentRouter(config)
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_read_1",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_read_1",
+                "content": generate_python_code(20),
+            },
+        ]
+
+        result = router.apply(messages, tokenizer)
+
+        assert result.messages[1]["content"] == messages[1]["content"]
+        assert "router:excluded:tool" in result.transforms_applied
+        assert "router:unresolved:tool_id" not in result.transforms_applied
 
 
 # =============================================================================
