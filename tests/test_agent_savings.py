@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -138,16 +141,39 @@ def test_compress_applies_agent_savings_profile_to_pipeline(monkeypatch) -> None
     assert captured["min_tokens_to_compress"] == 120
 
 
-def test_compress_savings_profile_does_not_mutate_supplied_config(monkeypatch) -> None:
+def test_compress_savings_profile_does_not_override_explicit_config(monkeypatch) -> None:
+    """Regression test for the precedence inversion (see agent_savings module
+    docstring: "CLI flag > env var > explicit kwarg > profile default >
+    dataclass default").
+
+    Before the fix, ``compress()`` called ``apply_agent_savings_profile``
+    unconditionally *after* the caller's config/kwargs were applied, so the
+    profile silently clobbered every explicitly-set field -- this test used
+    to assert exactly that bug (``captured["min_tokens_to_compress"] == 120``,
+    the profile's value, even though the caller passed 999). That assertion
+    encoded a bug, not intended behavior: an operator who explicitly set
+    ``min_tokens_to_compress=999`` alongside a savings profile had their
+    override silently discarded with no warning. This test now asserts the
+    documented contract instead: a field the caller diverged from its
+    dataclass default wins over the profile; a field left at its default is
+    filled in by the profile.
+
+    ``compress_user_messages=False`` and ``target_ratio=None`` are passed
+    explicitly here but are *not* distinguishable from "unset" because they
+    equal CompressConfig's own defaults for those fields -- a known,
+    documented limitation shared with the proxy path (see
+    ``proxy_pipeline_kwargs``'s handling of ``min_tokens_to_crush`` /
+    ``max_items_after_crush``), not something this fix claims to solve.
+    """
     captured: dict[str, object] = {}
     messages = [{"role": "user", "content": "x" * 500}]
     config = CompressConfig(
-        compress_user_messages=False,
-        compress_system_messages=False,
-        protect_recent=9,
-        protect_analysis_context=False,
-        target_ratio=None,
-        min_tokens_to_compress=999,
+        compress_user_messages=False,  # == CompressConfig default -> profile wins
+        compress_system_messages=False,  # != default (True) -> explicit wins
+        protect_recent=9,  # != default (4) -> explicit wins
+        protect_analysis_context=False,  # != default (True) -> explicit wins
+        target_ratio=None,  # == CompressConfig default -> profile wins
+        min_tokens_to_compress=999,  # != default (250) -> explicit wins
     )
 
     class Pipeline:
@@ -164,14 +190,79 @@ def test_compress_savings_profile_does_not_mutate_supplied_config(monkeypatch) -
 
     compress(messages, config=config, savings_profile=AGENT_90_PROFILE)
 
+    # Fields left at their dataclass default are filled in by the profile.
+    assert captured["compress_user_messages"] is True
     assert captured["target_ratio"] == 0.10
-    assert captured["min_tokens_to_compress"] == 120
+    # Fields the caller explicitly diverged from the default win over the
+    # profile -- this is the inversion this fix corrects.
+    assert captured["compress_system_messages"] is False
+    assert captured["protect_recent"] == 9
+    assert captured["protect_analysis_context"] is False
+    assert captured["min_tokens_to_compress"] == 999
+
+    # The supplied config object itself is never mutated by compress().
     assert config.compress_user_messages is False
     assert config.compress_system_messages is False
     assert config.protect_recent == 9
     assert config.protect_analysis_context is False
     assert config.target_ratio is None
     assert config.min_tokens_to_compress == 999
+
+
+@pytest.mark.parametrize(
+    ("field_kwarg", "proxy_config_field", "explicit_value", "profile_field"),
+    [
+        ("protect_recent", "protect_recent", 7, "protect_recent"),
+        ("target_ratio", "target_ratio", 0.42, "target_ratio"),
+        ("min_tokens_to_compress", "min_tokens_to_crush", 999, "min_tokens_to_compress"),
+        ("compress_system_messages", "compress_system_messages", False, "compress_system_messages"),
+        ("protect_analysis_context", "protect_analysis_context", False, "protect_analysis_context"),
+    ],
+)
+def test_compress_and_proxy_resolve_explicit_overrides_identically(
+    monkeypatch,
+    field_kwarg,
+    proxy_config_field,
+    explicit_value,
+    profile_field,
+) -> None:
+    """The library (`compress()`) and proxy (`proxy_pipeline_kwargs()`) entry
+    points must resolve `(explicit override, active profile)` identically.
+    This is the test that would have caught the precedence inversion: before
+    the fix, `compress()` let the profile clobber the explicit value while
+    `proxy_pipeline_kwargs()` correctly let the explicit value win.
+    """
+    profile = get_agent_savings_profile(AGENT_90_PROFILE)
+    assert getattr(profile, profile_field) != explicit_value, (
+        "fixture must diverge from the profile default to be a meaningful check"
+    )
+
+    captured: dict[str, object] = {}
+    messages = [{"role": "user", "content": "x" * 500}]
+
+    class Pipeline:
+        def apply(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                messages=messages,
+                tokens_before=1000,
+                tokens_after=100,
+                transforms_applied=["test"],
+            )
+
+    monkeypatch.setattr(compress_module, "_get_pipeline", lambda: Pipeline())
+
+    compress(messages, savings_profile=AGENT_90_PROFILE, **{field_kwarg: explicit_value})
+
+    proxy_config = ProxyConfig(
+        savings_profile=AGENT_90_PROFILE,
+        **{proxy_config_field: explicit_value},
+    )
+    proxy_kwargs = proxy_pipeline_kwargs(proxy_config)
+
+    assert captured[field_kwarg] == explicit_value
+    assert proxy_kwargs[field_kwarg] == explicit_value
+    assert captured[field_kwarg] == proxy_kwargs[field_kwarg]
 
 
 def test_wrap_agent_savings_profile_is_opt_in(monkeypatch) -> None:
@@ -343,6 +434,22 @@ def test_proxy_explicit_config_overrides_agent_90_profile() -> None:
     assert kwargs["min_tokens_to_compress"] == 300
 
 
+def test_proxy_explicit_protect_recent_overrides_read_protection_window() -> None:
+    """Regression test for the stale-effective-config bug: `read_protection_window`
+    is ContentRouter's own read-lifecycle-protection knob and must track an
+    explicit `protect_recent` override the same way `protect_recent` itself
+    does, or ContentRouter silently keeps using the profile's window after an
+    operator overrides it (and /health, /stats report the stale profile
+    value instead of what's actually running -- see test_proxy_healthchecks.py).
+    """
+    config = ProxyConfig(savings_profile="agent-90", protect_recent=7)
+
+    kwargs = proxy_pipeline_kwargs(config)
+
+    assert kwargs["protect_recent"] == 7
+    assert kwargs["read_protection_window"] == 7
+
+
 def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:
     router = ContentRouter(
         ContentRouterConfig(
@@ -413,6 +520,68 @@ def test_proxy_cli_reads_agent_90_profile_env() -> None:
     config = captured_config["config"]
     assert config.savings_profile == "agent-90"
     assert proxy_pipeline_kwargs(config)["target_ratio"] == 0.10
+
+
+def test_proxy_cli_rejects_unknown_savings_profile_env_cleanly() -> None:
+    """Before this fix, an unknown HEADROOM_SAVINGS_PROFILE crashed
+    `headroom proxy` with a raw Python traceback from deep inside
+    `HeadroomProxy.__init__` (called via `run_server` -> `create_app`).
+    The CLI now validates env-sourced config up front and exits cleanly.
+    `run_server` is mocked so this test also pins that it's never reached.
+    """
+
+    def mock_run_server(config: ProxyConfig, **kwargs: object) -> None:
+        raise AssertionError("run_server must not be reached for an invalid profile")
+
+    runner = CliRunner()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("headroom.proxy.server.run_server", mock_run_server)
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_SAVINGS_PROFILE": "bogus"},
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code != 0
+    assert "unknown savings profile" in result.output
+    assert "agent-90" in result.output  # actionable: lists the valid profiles
+
+
+def test_proxy_cli_rejects_unknown_mode_env_cleanly() -> None:
+    """Companion to the profile case above: an unknown HEADROOM_MODE now
+    fails the same way (clean CLI error, `run_server` never reached)
+    instead of silently falling back to 'token' with only a log warning.
+    """
+
+    def mock_run_server(config: ProxyConfig, **kwargs: object) -> None:
+        raise AssertionError("run_server must not be reached for an invalid mode")
+
+    runner = CliRunner()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("headroom.proxy.server.run_server", mock_run_server)
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_MODE": "bogus"},
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code != 0
+    assert "unknown HEADROOM_MODE" in result.output
+
+
+def test_agent_savings_cli_rejects_unknown_profile_cleanly() -> None:
+    """`headroom agent-savings --profile bogus` used to raise a raw
+    ValueError, which click prints as a full traceback (ValueError isn't a
+    click.ClickException). It now exits cleanly with the same actionable
+    message `get_agent_savings_profile` already produces.
+    """
+    result = CliRunner().invoke(main, ["agent-savings", "--profile", "bogus"])
+
+    assert result.exit_code != 0
+    assert "unknown savings profile" in result.output
+    assert "agent-90" in result.output
 
 
 def test_unit_router_receives_agent_target_ratio() -> None:
@@ -660,3 +829,28 @@ def test_agent_savings_smoke_fixture_passes_real_gate(tmp_path) -> None:
     assert "codex: 91.0% savings meets 90.0%" in gate_result.output
     assert "cursor: 93.0% savings meets 90.0%" in gate_result.output
     assert "100.0% accuracy meets 90.0%" in gate_result.output
+
+
+def test_docs_savings_profile_table_matches_profiles() -> None:
+    """The Savings Profile table in docs/content/docs/configuration.mdx and
+    wiki/configuration.md is generated from `_PROFILES` (see
+    scripts/render_savings_profile_table.py) instead of hand-maintained, so
+    it cannot silently drift the way a hand-written table could. This test
+    is the CI check: it fails the moment a profile's values change without
+    also running `--write` to resync the docs.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "scripts" / "render_savings_profile_table.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "--check"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, (
+        f"Savings-profile docs are out of sync with _PROFILES "
+        f"(run `python scripts/render_savings_profile_table.py --write`):\n"
+        f"{result.stdout}{result.stderr}"
+    )

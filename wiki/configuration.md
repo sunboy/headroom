@@ -475,9 +475,57 @@ provider = GoogleProvider(
 )
 ```
 
+## Savings Profiles
+
+`compress()` and the proxy both accept a named `savings_profile` (or the
+`HEADROOM_SAVINGS_PROFILE` env var) that fills in a coherent set of
+compression knobs in one step. There are two profiles:
+
+<!-- headroom:savings-profiles:start -->
+_Generated from `headroom/agent_savings.py::_PROFILES` by `scripts/render_savings_profile_table.py` -- do not edit by hand._
+
+| Field | `agent-90` | `balanced` |
+|---|---|---|
+| `savings_percent` | 90% | 70% |
+| `target_savings` | 0.90 | 0.70 |
+| `target_ratio` | 0.10 | 0.30 |
+| `compress_user_messages` | True | False |
+| `compress_system_messages` | True | False |
+| `protect_recent` | 2 | 4 |
+| `protect_analysis_context` | True | True |
+| `min_tokens_to_compress` | 120 | 250 |
+| `max_items_after_crush` | 8 | 15 |
+| `smart_crusher_with_compaction` | False | True |
+| `force_kompress` | True | False |
+| `proxy_mode` | token | token |
+| `accuracy_guard` | strict | strict |
+<!-- headroom:savings-profiles:end -->
+
+An unrecognized profile name (or `HEADROOM_MODE` value) fails fast with an
+error listing the valid options, rather than silently falling back to a
+default.
+
+### Savings Profile Precedence
+
+A compression knob a profile also sets (`protect_recent`, `target_ratio`,
+`min_tokens_to_compress`, `compress_system_messages`, ...) resolves in this
+order, highest priority first:
+
+1. CLI flag (`headroom proxy --mode ...`)
+2. Environment variable (`HEADROOM_*`)
+3. Explicit kwarg / config field (a `compress()` argument, or a field set on
+   the `CompressConfig`/`ProxyConfig` you passed in)
+4. The active savings profile's default
+5. The library's own dataclass default
+
+This order is identical on both the `compress()` path and the proxy path --
+an explicit value always beats the profile, and only a knob you left unset
+gets filled in from the profile.
+
 ## Configuration Precedence
 
-Settings are applied in this order (later overrides earlier):
+For settings a savings profile doesn't touch, plain SDK configuration is
+applied in this order (later overrides earlier):
 
 1. Default values
 2. Environment variables
