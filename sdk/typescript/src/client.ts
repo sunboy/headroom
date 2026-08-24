@@ -372,7 +372,12 @@ export class HeadroomClient implements HeadroomClientInterface {
       total_tokens_after: (stats.tokens?.total_before_compression ?? 0) - (stats.tokens?.saved ?? 0),
       total_tokens_saved: stats.tokens?.saved ?? 0,
       average_compression_ratio: stats.tokens?.savings_percent ? stats.tokens.savings_percent / 100 : 0,
+      // cache_hits is the pre-existing union field — kept unchanged for
+      // compatibility. provider/response are the new granular siblings;
+      // both default to 0 against an older proxy that doesn't send them.
       cache_hits: stats.requests?.cached ?? 0,
+      provider_cache_hits: stats.requests?.provider_cache_hits ?? 0,
+      response_cache_hits: stats.requests?.response_cache_hits ?? 0,
       by_mode: {},
     });
   }

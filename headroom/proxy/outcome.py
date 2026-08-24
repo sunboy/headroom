@@ -86,6 +86,24 @@ class RequestOutcome:
     # never reached the provider at all. Used to drive the
     # Prometheus ``cached`` counter and dashboard "response cache" row.
     from_response_cache: bool = False
+    # Tokens saved specifically by Headroom's own response cache serving
+    # this request (i.e. ``cached.tokens_saved_per_hit`` from the
+    # ``CacheEntry`` that was hit). Distinct from ``tokens_saved``, which
+    # on a response-cache hit stays 0 (the request never reached the
+    # compression pipeline at all — changing that would alter
+    # ``tokens_saved_total`` / ``savings.total_tokens``, a breaking
+    # semantic change). This sibling field is the honest place for the
+    # response-cache savings number. Additive-only; defaults to 0 so
+    # every non-response-cache-hit outcome is unaffected.
+    response_cache_tokens_saved: int = 0
+    # Tokens saved specifically by OpenAI Responses tool-schema
+    # compaction (``openai:responses:tool_schema_compaction``), a subset
+    # of ``tokens_saved`` that was previously only visible as a string
+    # tag in ``transforms_applied`` with no numeric breakdown. Kept
+    # separate from ``tokens_saved`` (which still carries the combined
+    # total, unchanged) so dashboards can distinguish "we deferred a
+    # tool schema" from "we compressed message content".
+    tool_schema_tokens_saved: int = 0
 
     # ── Timing ────────────────────────────────────────────────────────
     # total_latency_ms: wall-clock end-to-end for this request
@@ -358,6 +376,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         tokens_saved=outcome.tokens_saved,
         latency_ms=outcome.total_latency_ms,
         cached=outcome.cache_hit,
+        # Granular siblings of ``cached`` — see ``RequestOutcome.cache_hit``
+        # for why the two concepts were collapsed pre-fix. Passed
+        # alongside, never instead of, the union boolean above.
+        provider_cache_hit=outcome.cache_read_tokens > 0,
+        response_cache_hit=outcome.from_response_cache,
         overhead_ms=outcome.overhead_ms,
         ttfb_ms=outcome.ttfb_ms,
         pipeline_timing=outcome.pipeline_timing,
@@ -368,6 +391,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cache_write_1h_tokens=outcome.cache_write_1h_tokens,
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
+        tool_schema_tokens_saved=outcome.tool_schema_tokens_saved,
+        response_cache_tokens_saved=outcome.response_cache_tokens_saved,
         project=project,
         client=outcome.client,
     )

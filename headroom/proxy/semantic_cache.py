@@ -98,11 +98,23 @@ class SemanticCache:
         """Get cache statistics."""
         async with self._lock:
             total_hits = sum(e.hit_count for e in self._cache.values())
+            # ``tokens_saved_per_hit`` is written on every ``set()`` call but,
+            # pre-fix, was never aggregated anywhere — a dead field. Each
+            # entry's per-hit figure times its accumulated hit_count gives
+            # the total tokens Headroom's response cache has saved so far.
+            # This is intentionally separate from ``tokens_saved_total`` on
+            # PrometheusMetrics: response-cache hits never reach the
+            # compression pipeline, so folding it in would change what that
+            # total means.
+            total_tokens_saved = sum(
+                e.tokens_saved_per_hit * e.hit_count for e in self._cache.values()
+            )
             return {
                 "entries": len(self._cache),
                 "max_entries": self.max_entries,
                 "total_hits": total_hits,
                 "ttl_seconds": self.ttl_seconds,
+                "total_tokens_saved": total_tokens_saved,
             }
 
     async def clear(self):

@@ -249,6 +249,14 @@ def build_prefix_cache_stats(
     totals["net_savings_usd"] = round(totals["savings_usd"], 4)
     totals["savings_usd"] = round(totals["savings_usd"], 4)
     totals["write_premium_usd"] = round(totals["write_premium_usd"], 4)
+    # `savings_usd` / `net_savings_usd` here are 100% provider-native prompt-
+    # cache economics: every cache read counts as a "win", with no discount
+    # for the share of hit-rate CacheAligner / prefix-freeze actually
+    # contributed vs. what the provider's own caching would have achieved
+    # unassisted. This machine-readable tag makes that scope explicit next
+    # to the numbers (see the ``attribution`` prose string below, and
+    # ``cachealigner_uplift`` for the honest not-yet-computed uplift slot).
+    totals["attribution"] = "provider_native_baseline"
     # Token-level hit rate across all providers
     _total_input = (
         totals["cache_read_tokens"] + totals["cache_write_tokens"] + totals["uncached_input_tokens"]
@@ -312,6 +320,32 @@ def build_prefix_cache_stats(
             "Observed TTL bucket metrics reflect provider-reported cache write usage "
             "(for example Anthropic 5m vs 1h), not configured or remaining TTL."
         ),
+        # Honest placeholder for "how much of the cache hit rate above is
+        # attributable to CacheAligner / prefix-freeze specifically, vs.
+        # what the provider's own caching would have achieved with an
+        # unmodified prefix". `totals.savings_usd` is NOT that number — it's
+        # the full provider-native baseline (see `totals.attribution`).
+        # Computing a real uplift needs a counterfactual (e.g. an A/B
+        # holdout without prefix stabilization), which doesn't exist yet.
+        # Mirrors the `{method, ci_low, ci_high}` shape ``output_savings``
+        # uses once it does have a measured/estimated value — so the
+        # schema has a stable, honest home for this instead of a number
+        # that overstates what Headroom did.
+        "cachealigner_uplift": {
+            "available": False,
+            "method": None,
+            "tokens_saved": None,
+            "savings_usd": None,
+            "ci_low_percent": None,
+            "ci_high_percent": None,
+            "description": (
+                "Not yet computed. Would require a counterfactual measurement "
+                "(e.g. an A/B holdout comparing hit rate with vs. without "
+                "CacheAligner/prefix-freeze) to isolate Headroom's contribution "
+                "from provider-native cache economics already reported in "
+                "totals.savings_usd."
+            ),
+        },
     }
 
 

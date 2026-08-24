@@ -1234,6 +1234,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timing: dict[str, float] | None = None,
+        savings_breakdown: dict[str, int] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -1241,6 +1242,14 @@ class OpenAIHandlerMixin:
         function is envelope-agnostic: it extracts Responses text slots into
         provider-neutral compression units, lets ContentRouter choose the
         compressor, then splices accepted replacements back into the payload.
+
+        ``savings_breakdown``, like ``timing``, is an optional mutable
+        out-param (never part of the return tuple, so existing exact-arity
+        callers/tests are unaffected). When provided, this pass adds its
+        tool-schema-compaction contribution to
+        ``savings_breakdown["tool_schema_tokens_saved"]`` so callers can
+        report that number separately from the combined ``tokens_saved``
+        this function returns (which still includes it, unchanged).
         """
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
@@ -1299,11 +1308,16 @@ class OpenAIHandlerMixin:
             try:
                 tool_token_started = time.perf_counter()
                 tokenizer = self.openai_provider.get_token_counter(model)
-                tokens_saved += max(
+                _tool_schema_delta = max(
                     0,
                     tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
                     - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
                 )
+                tokens_saved += _tool_schema_delta
+                if savings_breakdown is not None:
+                    savings_breakdown["tool_schema_tokens_saved"] = savings_breakdown.get(
+                        "tool_schema_tokens_saved", 0
+                    ) + _tool_schema_delta
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
             except Exception:
                 pass
@@ -1454,8 +1468,15 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        savings_breakdown: dict[str, int] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
+        # Populated in-place by the executor thread (plain dict writes are
+        # fine under the GIL, same pattern as ``timing`` above). When the
+        # caller passes its own dict it's mutated directly; otherwise we
+        # use a throwaway local so ``_compress_openai_responses_payload``
+        # always sees a dict to write into.
+        _breakdown: dict[str, int] = savings_breakdown if savings_breakdown is not None else {}
 
         def _compress():  # noqa: ANN202
             try:
@@ -1464,15 +1485,26 @@ class OpenAIHandlerMixin:
                     model=model,
                     request_id=request_id,
                     timing=timing,
+                    savings_breakdown=_breakdown,
                 )
             except TypeError as exc:
-                if "unexpected keyword argument 'timing'" not in str(exc):
+                if "unexpected keyword argument" not in str(exc):
                     raise
-                return self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                )
+                try:
+                    return self._compress_openai_responses_payload(
+                        payload,
+                        model=model,
+                        request_id=request_id,
+                        timing=timing,
+                    )
+                except TypeError as exc2:
+                    if "unexpected keyword argument 'timing'" not in str(exc2):
+                        raise
+                    return self._compress_openai_responses_payload(
+                        payload,
+                        model=model,
+                        request_id=request_id,
+                    )
 
         result = await self._run_compression_in_executor(
             _compress,
@@ -1728,6 +1760,10 @@ class OpenAIHandlerMixin:
                         tokens_saved=0,
                         attempted_input_tokens=0,
                         from_response_cache=True,
+                        # See the Anthropic cache-hit site for why
+                        # ``tokens_saved`` stays 0 and this sibling field
+                        # carries the response-cache savings instead.
+                        response_cache_tokens_saved=cached.tokens_saved_per_hit,
                         total_latency_ms=_cache_hit_latency,
                         num_messages=len(messages),
                         tags=tags,
@@ -2956,6 +2992,11 @@ class OpenAIHandlerMixin:
         optimized_messages = messages
         optimized_tokens = original_tokens
         tokens_saved = 0
+        # Subset of `tokens_saved` contributed specifically by tool-schema
+        # compaction/deferral (vs. generic content compression). Populated
+        # from `_compress_openai_responses_payload`'s ``savings_breakdown``
+        # out-param below when that pass runs; stays 0 otherwise.
+        tool_schema_tokens_saved = 0
         # Eligible-only denominator for the active compression ratio.
         # Populated by `_compress_openai_responses_payload` if it runs;
         # stays 0 on bypass / passthrough paths so we don't fabricate a
@@ -3158,6 +3199,7 @@ class OpenAIHandlerMixin:
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
         if self.config.optimize and not _bypass:
+            _savings_breakdown: dict[str, int] = {}
             try:
                 (
                     body,
@@ -3173,8 +3215,12 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    savings_breakdown=_savings_breakdown,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
+                tool_schema_tokens_saved = int(
+                    _savings_breakdown.get("tool_schema_tokens_saved", 0)
+                )
                 if _modified:
                     tokens_saved = int(_tokens_saved)
                     optimized_tokens = max(0, original_tokens - tokens_saved)
@@ -3483,6 +3529,7 @@ class OpenAIHandlerMixin:
                         output_tokens=output_tokens,
                         tokens_saved=tokens_saved,
                         attempted_input_tokens=attempted_input_tokens,
+                        tool_schema_tokens_saved=tool_schema_tokens_saved,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         uncached_input_tokens=uncached_input_tokens,

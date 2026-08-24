@@ -2577,6 +2577,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Build prefix cache stats once (used in both prefix_cache and cost)
         prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
 
+        # Semantic (response) cache stats — fetched once, used both for the
+        # top-level "cache" key (unchanged) and the new
+        # savings.by_layer.response_cache breakdown below.
+        semantic_cache_stats = await proxy.cache.stats() if proxy.cache else {}
+        response_cache_tokens_saved = (
+            semantic_cache_stats.get("total_tokens_saved", 0) if semantic_cache_stats else 0
+        )
+
         # Fetch CLI filtering savings from the selected context tool. These
         # tokens are avoided before they reach model context.
         cli_filtering_stats = await asyncio.to_thread(_get_context_tool_stats)
@@ -2749,8 +2757,46 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                             "Dashboard token savings also includes CLI context-tool filtering."
                         ),
                     },
+                    "tool_schema_deferral": {
+                        "tokens": m.tool_schema_tokens_saved_total,
+                        # Already included in compression.tokens /
+                        # tokens.saved above — this is a breakdown, not an
+                        # additional total. Previously the only signal
+                        # that tool-schema compaction ran at all was the
+                        # "openai:responses:tool_schema_compaction" string
+                        # in transforms_applied, with no numeric figure.
+                        "included_in": "savings.by_layer.compression.tokens",
+                        "description": (
+                            "Tokens deferred by OpenAI Responses tool-schema "
+                            "compaction — a subset of proxy compression, broken out "
+                            "separately from generic content compression."
+                        ),
+                    },
+                    "response_cache": {
+                        "tokens": response_cache_tokens_saved,
+                        "tokens_saved": response_cache_tokens_saved,
+                        # NOT included in compression.tokens / tokens.saved —
+                        # a response-cache hit never enters the compression
+                        # pipeline, so folding it in would change what those
+                        # totals mean (see RequestOutcome.response_cache_tokens_saved).
+                        "included_in": None,
+                        "description": (
+                            "Tokens saved by requests served from Headroom's own "
+                            "response (semantic) cache — the provider was never "
+                            "called. Distinct from prefix_cache below, which is "
+                            "provider-native prompt-cache economics. Aggregated from "
+                            "CacheEntry.tokens_saved_per_hit, which was tracked but "
+                            "never surfaced before this fix."
+                        ),
+                    },
                     "prefix_cache": {
                         "discount_usd": round(cache_net_usd, 4),
+                        # Machine-readable counterpart to the prose below —
+                        # see prefix_cache_stats.totals.attribution /
+                        # prefix_cache_stats.cachealigner_uplift (top-level
+                        # "prefix_cache" key) for the honest not-yet-computed
+                        # uplift slot.
+                        "attribution": "provider_native_baseline",
                         "description": (
                             "Cost discount from provider prefix caching. "
                             "Headroom's CacheAligner improves hit rates; "
@@ -2770,7 +2816,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "requests": {
                 "total": m.requests_total,
+                # ``cached`` is the pre-existing union of the two fields
+                # below — kept unchanged for compatibility. The two new
+                # fields let dashboards distinguish upstream provider
+                # prompt-cache hits from Headroom's own response-cache
+                # hits, which were previously collapsed into this one
+                # count with no way to tell them apart.
                 "cached": m.requests_cached,
+                "provider_cache_hits": m.requests_provider_cache_hit,
+                "response_cache_hits": m.requests_response_cache_hit,
                 "rate_limited": m.requests_rate_limited,
                 "failed": m.requests_failed,
                 "by_provider": dict(m.requests_by_provider),
@@ -2978,7 +3032,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "cli_filtering": cli_filtering_stats,
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
-            "cache": await proxy.cache.stats() if proxy.cache else None,
+            "cache": semantic_cache_stats or None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
             **recent_request_payload,
             "log_full_messages": proxy.config.log_full_messages if proxy else False,
