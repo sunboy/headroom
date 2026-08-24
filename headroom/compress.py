@@ -210,6 +210,10 @@ def compress(
             setattr(cfg, key, value)
     if cfg.savings_profile:
         cfg = replace(cfg)
+        # Fills in only the fields still at their CompressConfig default --
+        # an explicit config field or kwarg above always wins over the
+        # profile. See the precedence order documented in the
+        # headroom.agent_savings module docstring.
         apply_agent_savings_profile(cfg, cfg.savings_profile)
 
     pipeline = _get_pipeline()

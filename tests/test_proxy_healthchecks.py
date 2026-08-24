@@ -124,6 +124,47 @@ def test_health_reports_agent_savings_config():
     assert reported["accuracy_guard"] == "strict"
 
 
+def test_health_reports_explicit_protect_recent_override_not_stale_profile_value():
+    """Regression test for the stale-effective-config bug: with a savings
+    profile active AND an explicit `protect_recent` override that
+    deliberately differs from the profile's own value (agent-90's is 2),
+    /health must report what ContentRouter is actually using (7), not the
+    profile default. The existing `test_health_reports_agent_savings_config`
+    above can't catch this because it passes `protect_recent=2`, which
+    happens to equal agent-90's own default -- so before the fix this test
+    fails (reports 2) while the equivalent case with matching values passes.
+    """
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        savings_profile="agent-90",
+        protect_recent=7,
+    )
+    app = create_app(config)
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        health_response = client.get("/health")
+        stats_response = client.get("/stats")
+
+    assert health_response.status_code == 200
+    assert health_response.json()["config"]["protect_recent"] == 7
+    assert stats_response.status_code == 200
+    assert stats_response.json()["config"]["protect_recent"] == 7
+
+
+def test_create_app_rejects_unknown_savings_profile():
+    """Pins ValueError propagation, with an actionable message, from the
+    full startup path (`HeadroomProxy.__init__` -> `proxy_pipeline_kwargs`
+    -> `create_app`) -- previously only the low-level
+    `get_agent_savings_profile` raise itself was tested, not that it still
+    surfaces cleanly once wired through proxy construction.
+    """
+    with pytest.raises(ValueError, match="unknown savings profile"):
+        create_app(ProxyConfig(savings_profile="bogus"))
+
+
 def test_health_includes_deployment_metadata_when_present(monkeypatch):
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "default")

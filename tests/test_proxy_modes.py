@@ -23,8 +23,19 @@ def test_proxy_mode_normalizes_legacy_aliases() -> None:
     assert normalize_proxy_mode("cache_mode") == PROXY_MODE_CACHE
 
 
-def test_proxy_mode_invalid_falls_back_to_default() -> None:
-    assert normalize_proxy_mode("wat", default=PROXY_MODE_CACHE) == PROXY_MODE_CACHE
+def test_proxy_mode_invalid_raises_with_valid_modes_listed() -> None:
+    """Unknown HEADROOM_MODE now fails fast instead of silently falling back
+    to `default` -- this used to warn-and-fallback, which let an operator
+    believe a mode was active when it wasn't. Consistent with
+    `get_agent_savings_profile`'s existing fail-fast behavior for an unknown
+    HEADROOM_SAVINGS_PROFILE; see the module docstring in
+    headroom/proxy/modes.py for the rationale. The `headroom proxy` CLI
+    turns this into a clean error rather than a raw traceback -- see
+    test_agent_savings.py::test_proxy_cli_rejects_unknown_mode_env_cleanly
+    and test_proxy_healthchecks.py::test_create_app_rejects_unknown_savings_profile.
+    """
+    with pytest.raises(ValueError, match="token"):
+        normalize_proxy_mode("wat", default=PROXY_MODE_CACHE)
 
 
 def test_proxy_mode_predicates() -> None:

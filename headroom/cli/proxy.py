@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 import click
 
 from headroom import paths as _paths
+from headroom.agent_savings import get_agent_savings_profile
 from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
 from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
@@ -895,10 +896,22 @@ def proxy(
     # Resolve anyllm provider: env var takes precedence over CLI default (matches argparse path)
     effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
 
-    # Resolve mode: CLI flag > env var > default
-    effective_mode: str = normalize_proxy_mode(
-        mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN
-    )
+    # Resolve mode: CLI flag > env var > default. Both this and the
+    # HEADROOM_SAVINGS_PROFILE lookup below fail fast on an unrecognized
+    # value (see headroom/proxy/modes.py and headroom/agent_savings.py for
+    # the rationale); catch that here -- before any startup output -- so an
+    # operator gets one clean, actionable line instead of a raw traceback
+    # deep inside `run_server`/`create_app`.
+    try:
+        effective_mode: str = normalize_proxy_mode(
+            mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN
+        )
+        _savings_profile_env = os.environ.get("HEADROOM_SAVINGS_PROFILE") or None
+        if _savings_profile_env:
+            get_agent_savings_profile(_savings_profile_env)
+    except ValueError as exc:
+        click.secho(f"Error: {exc}", fg="red", err=True)
+        raise SystemExit(1) from None
 
     # Stateless mode: CLI flag or env var
     is_stateless = stateless or os.environ.get("HEADROOM_STATELESS", "").lower() in (

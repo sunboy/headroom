@@ -76,7 +76,14 @@ def agent_savings(
 ) -> None:
     """Render or verify Codex/Claude/Cursor token-savings settings."""
 
-    savings_profile = get_agent_savings_profile(profile)
+    try:
+        savings_profile = get_agent_savings_profile(profile)
+    except ValueError as exc:
+        # get_agent_savings_profile raises a plain ValueError with an
+        # actionable message ("unknown savings profile ...; expected one
+        # of: ..."); without this, click lets it propagate as a raw
+        # traceback since ValueError isn't a click.ClickException.
+        raise click.ClickException(str(exc)) from None
     if write_smoke_fixture is not None:
         eval_path = _write_smoke_fixture(write_smoke_fixture)
         click.echo(f"Wrote agent-90 smoke fixture to {write_smoke_fixture}")
