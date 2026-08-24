@@ -380,6 +380,20 @@ class ProxyConfig:
     # ``HeadroomProxy._run_compression_in_executor``.
     compression_max_workers: int | None = None
 
+    # Bounded capacity-reclamation watchdog threshold: once this many
+    # compression-executor threads are simultaneously "leaked" (still
+    # running past their ``asyncio.wait_for`` deadline — see
+    # ``compression_max_workers`` above), the executor is recycled so new
+    # compression calls get a fresh, full-capacity pool instead of queuing
+    # behind zombie threads that may never return. ``None`` resolves to
+    # ``compression_max_workers`` (recycle only once the pool has zero
+    # healthy slots left). Set lower to recycle more eagerly; the
+    # reclaimed old pool's zombie threads are never interrupted (Python
+    # cannot preempt a running thread) — they keep running in the
+    # background and are simply no longer reachable for new work. See
+    # ``HeadroomProxy._maybe_recycle_compression_executor_locked``.
+    compression_leak_recycle_threshold: int | None = None
+
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")

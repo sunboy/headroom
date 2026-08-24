@@ -13,6 +13,7 @@ import asyncio
 import logging
 import threading
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -237,6 +238,19 @@ class PrometheusMetrics:
             float(tracker_lifetime.get("total_input_cost_usd", 0.0) or 0.0),
             0.0,
         )
+
+        # Compression-executor gauges/counters (queued, in-flight, leaked
+        # threads, queue wait, executor recycles) live on ``HeadroomProxy``
+        # — they're mutated from worker threads under its own
+        # ``_compression_metrics_lock``, not any lock in this module.
+        # Rather than duplicate that tracking here (two copies that must
+        # stay in sync), ``export()`` pulls a point-in-time snapshot
+        # through this optional provider, registered once at proxy
+        # startup via ``set_compression_executor_snapshot_fn``. ``None``
+        # (the default) means no compression-executor series are
+        # exported — e.g. tests that construct ``PrometheusMetrics``
+        # standalone, with no owning proxy.
+        self._compression_executor_snapshot_fn: Callable[[], dict[str, int | float]] | None = None
 
         self._lock = asyncio.Lock()
         # Tiny synchronous critical section for stage-timing triple updates
@@ -728,6 +742,18 @@ class PrometheusMetrics:
                 if ms_val > self.stage_timing_max[key]:
                     self.stage_timing_max[key] = ms_val
 
+    def set_compression_executor_snapshot_fn(
+        self,
+        fn: Callable[[], dict[str, int | float]] | None,
+    ) -> None:
+        """Register the callable ``export()`` uses to pull a point-in-time
+        snapshot of the compression-executor gauges/counters owned by
+        ``HeadroomProxy`` (queued, in_flight, leaked_threads_total, etc.
+        — see ``HeadroomProxy._compression_executor_metrics_snapshot``).
+        Pass ``None`` to stop exporting the series.
+        """
+        self._compression_executor_snapshot_fn = fn
+
     async def record_cache_bust(self, tokens_lost: int) -> None:
         """Record tokens that lost their cache discount due to compression."""
         async with self._lock:
@@ -797,6 +823,18 @@ class PrometheusMetrics:
             stage_timing_sum_snapshot = dict(self.stage_timing_sum)
             stage_timing_count_snapshot = dict(self.stage_timing_count)
             stage_timing_max_snapshot = dict(self.stage_timing_max)
+        # Pull the compression-executor snapshot (see
+        # ``set_compression_executor_snapshot_fn``) outside of any lock
+        # held by this module — the provider takes HeadroomProxy's own
+        # ``_compression_metrics_lock`` internally. A failing/absent
+        # provider must never break the rest of the scrape.
+        compression_snapshot: dict[str, int | float] = {}
+        if self._compression_executor_snapshot_fn is not None:
+            try:
+                compression_snapshot = self._compression_executor_snapshot_fn() or {}
+            except Exception:
+                logger.debug("compression executor snapshot provider failed", exc_info=True)
+                compression_snapshot = {}
         async with self._lock:
             lines: list[str] = []
             _append_metric(
@@ -1066,6 +1104,93 @@ class PrometheusMetrics:
                         f'headroom_stage_timing_ms_max{{path="{_escape_label_value(path_label)}",stage="{_escape_label_value(stage)}"}} {round(max_value, 2)}'
                     )
                 lines.append("")
+
+            # Compression executor: bounded ThreadPoolExecutor backing
+            # ``pipeline.apply()``. Mirrors the ``stage_timing_*`` shape
+            # above — these were previously only in the JSON ``/stats``/
+            # ``/health`` ``runtime.compression_executor`` payload, which
+            # is not scrapeable/alertable. ``compression_total`` is the
+            # denominator for leak/timeout rates: e.g.
+            # ``headroom_compression_leaked_threads_total /
+            # headroom_compression_total``. ``leaked_in_flight`` and
+            # ``recycles_total`` surface the bounded-reclamation watchdog
+            # (see ``HeadroomProxy._maybe_recycle_compression_executor_locked``)
+            # — a non-zero, climbing ``recycles_total`` means the pool has
+            # been run dry and recycled, which is itself alert-worthy even
+            # though capacity was restored.
+            if compression_snapshot:
+                _append_metric(
+                    lines,
+                    name="headroom_compression_total",
+                    metric_type="counter",
+                    help_text="Total compression jobs submitted to the executor (denominator for leak/timeout rates)",
+                    value=compression_snapshot.get("compression_total", 0),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_queued",
+                    metric_type="gauge",
+                    help_text="Compression jobs currently queued, waiting for a free worker",
+                    value=compression_snapshot.get("queued", 0),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_in_flight",
+                    metric_type="gauge",
+                    help_text="Compression jobs currently running on the executor",
+                    value=compression_snapshot.get("in_flight", 0),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_run_seconds_total",
+                    metric_type="counter",
+                    help_text="Cumulative wall-clock seconds spent running compression jobs",
+                    value=round(float(compression_snapshot.get("run_seconds_total", 0.0)), 4),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_queue_wait_seconds_total",
+                    metric_type="counter",
+                    help_text="Cumulative seconds compression jobs spent queued before a worker picked them up",
+                    value=round(
+                        float(compression_snapshot.get("queue_wait_seconds_total", 0.0)), 4
+                    ),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_queue_timeouts_total",
+                    metric_type="counter",
+                    help_text="Compression jobs cancelled while still queued (timed out before a worker started)",
+                    value=compression_snapshot.get("queue_timeouts_total", 0),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_leaked_threads_total",
+                    metric_type="counter",
+                    help_text="Compression worker threads that finished AFTER their asyncio deadline (Python cannot preempt a running thread)",
+                    value=compression_snapshot.get("leaked_threads_total", 0),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_leaked_in_flight",
+                    metric_type="gauge",
+                    help_text="Leaked compression threads that are still running right now, consuming a pool slot",
+                    value=compression_snapshot.get("leaked_in_flight", 0),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_recycles_total",
+                    metric_type="counter",
+                    help_text="Times the compression executor was recycled after hitting the leaked-thread capacity threshold",
+                    value=compression_snapshot.get("recycles_total", 0),
+                )
+                _append_metric(
+                    lines,
+                    name="headroom_compression_max_workers",
+                    metric_type="gauge",
+                    help_text="Configured compression executor pool size",
+                    value=compression_snapshot.get("max_workers", 0),
+                )
 
             # Unit 3: WS session lifecycle gauges + duration histogram.
             lines.extend(
