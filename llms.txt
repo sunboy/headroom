@@ -37,7 +37,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 - [SmartCrusher](https://headroom-docs.vercel.app/docs/smart-crusher): Statistical JSON / array compression (70–90% on tool outputs).
 - [Code compression](https://headroom-docs.vercel.app/docs/code-compression): AST-aware via tree-sitter (preserves imports, signatures, types).
 - [Text & log compression](https://headroom-docs.vercel.app/docs/text-and-logs): Search results, build logs, diffs.
-- [CCR (reversible)](https://headroom-docs.vercel.app/docs/ccr): Compress-Cache-Retrieve — originals never deleted; LLM retrieves on demand.
+- [CCR (reversible)](https://headroom-docs.vercel.app/docs/ccr): Compress-Cache-Retrieve — originals stored and retrievable on demand within the configured retention window, when the marker, store, and retrieval tool are enabled.
 
 ## SDK / framework integrations
 
