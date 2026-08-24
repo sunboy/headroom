@@ -487,16 +487,55 @@ impl SmartCrusher {
                             let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                             let (crushed, strategy) = crush_string_array(&strs, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            let crushed_values: Vec<Value> =
+                            let mut crushed_values: Vec<Value> =
                                 crushed.into_iter().map(Value::String).collect();
+                            // CCR offload: `crush_string_array` drops
+                            // elements via the same stride-fill sampling
+                            // idea as `crush_array`'s dict row-drop path,
+                            // but (unlike DictArray) had no recovery
+                            // mechanism — this is the data-loss bug this
+                            // commit fixes. Append the marker as a plain
+                            // string: wrapping it in an object (like
+                            // DictArray's `_ccr_dropped` sentinel) would
+                            // break this array's string-homogeneity,
+                            // whereas a bare marker string preserves it.
+                            // See `is_ccr_dropped_marker` for the
+                            // single-predicate detector.
+                            let dropped = n.saturating_sub(crushed_values.len());
+                            if let Some(marker) = self.offload_dropped_for_ccr(arr, dropped) {
+                                crushed_values.push(Value::String(marker));
+                            }
                             return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::NumberArray => {
                             let (crushed, strategy) = crush_number_array(arr, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            return (Value::Array(crushed), info_parts.join(","));
+                            let mut crushed_values = crushed;
+                            // CCR offload: same rationale as StringArray
+                            // above, with one extra wrinkle — appending a
+                            // *string* marker to a number array means the
+                            // array is no longer purely numeric (its last
+                            // element becomes a string). We accept that
+                            // trade deliberately: the alternative is the
+                            // silent data loss this commit fixes (dropped
+                            // numbers vanished with zero recovery path).
+                            // A consumer that needs strict numeric
+                            // homogeneity can check `is_ccr_dropped_marker`
+                            // on the last element and strip it first.
+                            let dropped = n.saturating_sub(crushed_values.len());
+                            if let Some(marker) = self.offload_dropped_for_ccr(arr, dropped) {
+                                crushed_values.push(Value::String(marker));
+                            }
+                            return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::MixedArray => {
+                            // `crush_mixed_array` performs its own CCR
+                            // offload internally (one marker covering the
+                            // complete original mixed array — see its
+                            // doc comment) and appends the marker as the
+                            // last element of its returned Vec, same
+                            // convention as the String/Number branches
+                            // above.
                             let (crushed, strategy) =
                                 self.crush_mixed_array(arr, query_context, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
@@ -775,6 +814,38 @@ impl SmartCrusher {
         }
     }
 
+    /// Compute (and, if a store is configured, persist) a CCR-Dropped
+    /// marker for a row-drop on a **primitive or mixed** array —
+    /// StringArray / NumberArray / MixedArray. This is the sibling of
+    /// the inline row-drop marker logic in `crush_array` above (which
+    /// exists only for DictArray); factored out here so all four
+    /// crushable array types share one hash/store/marker contract
+    /// instead of DictArray being the only type with a working
+    /// recovery path.
+    ///
+    /// Hashes the **complete original** `original` slice, stashes those
+    /// exact bytes in the CCR store under that hash (if a store is
+    /// configured), and returns `<<ccr:HASH N_rows_offloaded>>`.
+    ///
+    /// Returns `None` when nothing was dropped, or when
+    /// `enable_ccr_marker` is off — the same gate `crush_array` uses,
+    /// so `enable_ccr_marker=false` keeps every array type
+    /// marker-free/store-free uniformly (see
+    /// `enable_ccr_marker_false_suppresses_marker_and_store`, and its
+    /// per-array-type siblings added alongside this fix).
+    fn offload_dropped_for_ccr(&self, original: &[Value], dropped_count: usize) -> Option<String> {
+        if dropped_count == 0 || !self.config.enable_ccr_marker {
+            return None;
+        }
+        let canonical = canonical_array_json(original);
+        let h = hash_canonical(&canonical);
+        let marker = format!("<<ccr:{h} {dropped_count}_rows_offloaded>>");
+        if let Some(store) = &self.ccr_store {
+            store.put(&h, &canonical);
+        }
+        Some(marker)
+    }
+
     /// Compress a mixed-type array by grouping items by type and
     /// compressing each group with the appropriate handler.
     ///
@@ -817,6 +888,22 @@ impl SmartCrusher {
 
             match type_key {
                 "dict" => {
+                    // `crush_array`'s own row-drop path may, internally,
+                    // hash + store + return a marker for *this
+                    // sub-group alone* (when it drops rows and
+                    // `enable_ccr_marker` is on). We deliberately do not
+                    // propagate that per-sub-group `ccr_hash` /
+                    // `dropped_summary` — see the whole-array offload at
+                    // the end of this function, which supersedes it with
+                    // a single marker covering the complete original
+                    // mixed array (dict rows + str rows + number rows,
+                    // whatever combination actually got dropped). That
+                    // is simpler for the retrieval tool (one hash per
+                    // array, not one per sub-group) and was the previous
+                    // bug anyway: this per-sub-group hash used to be
+                    // discarded with NO replacement, leaving stored data
+                    // with no pointer. Now there is always a pointer —
+                    // just not this one.
                     let CrushArrayResult { items: crushed, .. } =
                         self.crush_array(&values, query_context, bias);
                     // Find which original indices survived by matching
@@ -893,13 +980,32 @@ impl SmartCrusher {
         }
 
         // Reassemble in original order.
-        let result: Vec<Value> = keep_indices.iter().map(|&i| items[i].clone()).collect();
+        let mut result: Vec<Value> = keep_indices.iter().map(|&i| items[i].clone()).collect();
         let strategy = format!(
             "mixed:adaptive({}->{},{})",
             n,
             result.len(),
             strategy_parts.join(",")
         );
+
+        // ── CCR offload for the mixed array's row drops ──
+        //
+        // Any of the sub-groups above may have dropped elements: dict
+        // via `crush_array`'s lossy path, str/number via their own
+        // stride-fill sampling. Rather than stitching together
+        // per-sub-group markers (the dict sub-group's own hash was
+        // deliberately discarded above), offload the COMPLETE original
+        // mixed array ONCE here — one hash, one store write, one
+        // marker appended as the last element, mirroring the
+        // String/NumberArray convention in `process_value`. This is
+        // simpler than per-group markers and gives the retrieval tool
+        // exactly one place to look regardless of which sub-group(s)
+        // actually dropped rows.
+        let dropped_count = n.saturating_sub(result.len());
+        if let Some(marker) = self.offload_dropped_for_ccr(items, dropped_count) {
+            result.push(Value::String(marker));
+        }
+
         (result, strategy)
     }
 }
@@ -991,6 +1097,25 @@ fn estimate_array_bytes(item_strings: &[String]) -> usize {
 /// requires. Used by both the hash (input) and the store payload (write).
 fn canonical_array_json(items: &[Value]) -> String {
     serde_json::to_string(items).unwrap_or_default()
+}
+
+/// True when `v` is the CCR-Dropped marker appended to a **primitive or
+/// mixed** array's kept-items output — the StringArray, NumberArray,
+/// and MixedArray branches of `process_value` (and `crush_mixed_array`
+/// internally). One predicate so callers — tests, or any future
+/// downstream consumer — can check "did this array lose rows" the same
+/// way regardless of which array-type branch produced the output.
+///
+/// DictArray uses a different shape (`{"_ccr_dropped": "<<ccr:...>>"}`,
+/// see `process_value`) because it preserves the array's
+/// array-of-objects homogeneity; primitive/mixed arrays use a bare
+/// marker string instead, since wrapping it in an object would itself
+/// break homogeneity for a string/number array, and a plain string is
+/// already the cheapest way to carry it. Use this predicate rather than
+/// re-deriving the `<<ccr:` / `>>` check inline — it is the one place
+/// that convention is defined.
+pub fn is_ccr_dropped_marker(v: &Value) -> bool {
+    matches!(v, Value::String(s) if s.starts_with("<<ccr:") && s.ends_with(">>"))
 }
 
 /// 12-char SHA-256 hex prefix of an already-serialized canonical JSON
@@ -1677,5 +1802,459 @@ mod tests {
             store_len_after > store_len_before,
             "default should write to ccr_store"
         );
+    }
+
+    // ---------- Primitive-array CCR offload regression coverage ----------
+    //
+    // Data-loss bug: `process_value`'s StringArray / NumberArray /
+    // MixedArray branches dropped elements via their sampling
+    // strategies without ever writing the full original to the CCR
+    // store or emitting a retrieval marker — unlike DictArray, which
+    // has always done both. `crush_mixed_array`'s "dict" sub-group also
+    // discarded the `dropped_summary`/`ccr_hash` its own internal
+    // `crush_array` call produced, so even the one payload that *did*
+    // reach the store had no pointer in the prompt.
+    //
+    // Every test below exercises the full `process_value` entry point
+    // (not the lower-level `crush_*` helpers directly) because that is
+    // exactly the path a real prompt goes through, and it's the layer
+    // where the marker used to be missing.
+
+    /// Extract the hex hash out of a `<<ccr:HASH ...>>` /
+    /// `<<ccr:HASH,...>>` marker string.
+    fn extract_ccr_hash(marker: &str) -> &str {
+        marker
+            .strip_prefix("<<ccr:")
+            .expect("marker should start with <<ccr:")
+            .split(|c: char| c == ' ' || c == ',')
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn string_array_drop_offloads_full_original_to_ccr() {
+        let c = crusher();
+        let store = c.ccr_store().expect("default crusher has a ccr_store");
+        let items: Vec<Value> = (0..200).map(|i| json!(format!("row-{i}"))).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("StringArray stays an array");
+        assert!(
+            arr.len() < items.len(),
+            "expected rows dropped, got {} kept out of {}",
+            arr.len(),
+            items.len()
+        );
+
+        // Marker present as the last element, detectable via the
+        // shared predicate.
+        let marker_val = arr.last().expect("non-empty output");
+        assert!(
+            is_ccr_dropped_marker(marker_val),
+            "expected trailing CCR marker, got: {marker_val:?}"
+        );
+        let marker = marker_val.as_str().unwrap();
+        assert!(marker.contains("rows_offloaded"), "got: {marker}");
+
+        // Store actually grew.
+        assert!(
+            after > before,
+            "ccr_store did not grow on string-array drop"
+        );
+
+        // Round-trip: the stored bytes deserialize back to the
+        // COMPLETE original 200-element array, not just a count.
+        let hash = extract_ccr_hash(marker);
+        let stored = store.get(hash).expect("hash should resolve in store");
+        let restored: Vec<Value> =
+            serde_json::from_str(&stored).expect("stored payload is valid JSON");
+        assert_eq!(
+            restored, items,
+            "stored payload must equal full original input"
+        );
+    }
+
+    #[test]
+    fn number_array_drop_offloads_full_original_to_ccr() {
+        let c = crusher();
+        let store = c.ccr_store().expect("default crusher has a ccr_store");
+        let items: Vec<Value> = (0..200).map(|i| json!(i * 7)).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("NumberArray stays an array");
+        assert!(
+            arr.len() < items.len(),
+            "expected rows dropped, got {} kept out of {}",
+            arr.len(),
+            items.len()
+        );
+
+        let marker_val = arr.last().expect("non-empty output");
+        assert!(
+            is_ccr_dropped_marker(marker_val),
+            "expected trailing CCR marker, got: {marker_val:?}"
+        );
+        let marker = marker_val.as_str().unwrap();
+
+        assert!(
+            after > before,
+            "ccr_store did not grow on number-array drop"
+        );
+
+        let hash = extract_ccr_hash(marker);
+        let stored = store.get(hash).expect("hash should resolve in store");
+        let restored: Vec<Value> =
+            serde_json::from_str(&stored).expect("stored payload is valid JSON");
+        assert_eq!(
+            restored, items,
+            "stored payload must equal full original input"
+        );
+    }
+
+    #[test]
+    fn mixed_array_drop_offloads_full_original_to_ccr() {
+        let c = crusher();
+        let store = c.ccr_store().expect("default crusher has a ccr_store");
+        // Heterogeneous: strings / numbers / objects cycled so the
+        // array classifies as MixedArray rather than any homogeneous
+        // type.
+        let items: Vec<Value> = (0..200)
+            .map(|i| match i % 3 {
+                0 => json!(format!("s{i}")),
+                1 => json!(i),
+                _ => json!({"id": i, "status": "ok"}),
+            })
+            .collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("MixedArray stays an array");
+        assert!(
+            arr.len() < items.len(),
+            "expected rows dropped, got {} kept out of {}",
+            arr.len(),
+            items.len()
+        );
+
+        let marker_val = arr.last().expect("non-empty output");
+        assert!(
+            is_ccr_dropped_marker(marker_val),
+            "expected trailing CCR marker, got: {marker_val:?}"
+        );
+        let marker = marker_val.as_str().unwrap();
+
+        assert!(after > before, "ccr_store did not grow on mixed-array drop");
+
+        let hash = extract_ccr_hash(marker);
+        let stored = store.get(hash).expect("hash should resolve in store");
+        let restored: Vec<Value> =
+            serde_json::from_str(&stored).expect("stored payload is valid JSON");
+        assert_eq!(
+            restored, items,
+            "stored payload must equal the complete original mixed array"
+        );
+    }
+
+    #[test]
+    fn dict_array_drop_offloads_full_original_to_ccr_round_trip() {
+        // DictArray already had a working marker (this is the
+        // reference behavior every other type now matches); this test
+        // adds the round-trip assertion (full deserialized equality,
+        // not just a count) that the other new tests in this section
+        // also carry, via `process_value` end-to-end.
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force the lossy path
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusher::new(cfg);
+        let store = c.ccr_store().expect("default crusher has a ccr_store");
+        let items: Vec<Value> = (0..200).map(|_| json!({"status": "ok"})).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("DictArray stays an array");
+        assert!(arr.len() < items.len(), "expected rows dropped");
+
+        // Sentinel object is the last element.
+        let sentinel = arr.last().expect("non-empty output");
+        let marker = sentinel
+            .get("_ccr_dropped")
+            .and_then(|v| v.as_str())
+            .expect("last element should be the _ccr_dropped sentinel");
+        assert!(marker.starts_with("<<ccr:"));
+
+        assert!(after > before, "ccr_store did not grow on dict-array drop");
+
+        let hash = extract_ccr_hash(marker);
+        let stored = store.get(hash).expect("hash should resolve in store");
+        let restored: Vec<Value> =
+            serde_json::from_str(&stored).expect("stored payload is valid JSON");
+        assert_eq!(
+            restored, items,
+            "stored payload must equal full original input"
+        );
+    }
+
+    #[test]
+    fn bool_array_never_drops_and_never_touches_ccr() {
+        // BoolArray falls through to recursive descent in
+        // `process_value` (never crushed at the array level) — nothing
+        // is dropped, so there is nothing to offload. Confirms the fix
+        // didn't introduce spurious markers/store-writes on a type that
+        // was never part of the bug.
+        let c = crusher();
+        let store = c.ccr_store().expect("default crusher has a ccr_store");
+        let items: Vec<Value> = (0..200).map(|i| json!(i % 2 == 0)).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        assert_eq!(
+            out,
+            Value::Array(items),
+            "bool array must round-trip unchanged"
+        );
+        assert_eq!(after, before, "bool array must never write to ccr_store");
+    }
+
+    #[test]
+    fn nested_array_never_drops_and_never_touches_ccr() {
+        // NestedArray (array-of-arrays) also falls through to
+        // recursive descent at the top level; each inner array is
+        // below `min_items_to_analyze` so nothing is crushed anywhere.
+        let c = crusher();
+        let store = c.ccr_store().expect("default crusher has a ccr_store");
+        let items: Vec<Value> = (0..200).map(|i| json!([i, i + 1])).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        assert_eq!(
+            out,
+            Value::Array(items),
+            "nested array must round-trip unchanged"
+        );
+        assert_eq!(after, before, "nested array must never write to ccr_store");
+    }
+
+    #[test]
+    fn empty_array_never_drops_and_never_touches_ccr() {
+        let c = crusher();
+        let store = c.ccr_store().expect("default crusher has a ccr_store");
+
+        let before = store.len();
+        let (out, info) = c.process_value(&json!([]), 0, "", 1.0);
+        let after = store.len();
+
+        assert_eq!(out, json!([]));
+        assert!(info.is_empty());
+        assert_eq!(after, before, "empty array must never write to ccr_store");
+    }
+
+    // ---------- enable_ccr_marker=false variants (primitive/mixed types) ----------
+
+    #[test]
+    fn string_array_enable_ccr_marker_false_suppresses_marker_and_store() {
+        use crate::ccr::InMemoryCcrStore;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..200).map(|i| json!(format!("row-{i}"))).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("StringArray stays an array");
+        assert!(arr.len() < items.len(), "drop should still happen");
+        assert!(
+            arr.iter().all(|v| !is_ccr_dropped_marker(v)),
+            "no marker should be present when enable_ccr_marker=false"
+        );
+        assert_eq!(
+            after, before,
+            "ccr_store must not grow when enable_ccr_marker=false"
+        );
+    }
+
+    #[test]
+    fn number_array_enable_ccr_marker_false_suppresses_marker_and_store() {
+        use crate::ccr::InMemoryCcrStore;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..200).map(|i| json!(i * 7)).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("NumberArray stays an array");
+        assert!(arr.len() < items.len(), "drop should still happen");
+        assert!(
+            arr.iter().all(|v| !is_ccr_dropped_marker(v)),
+            "no marker should be present when enable_ccr_marker=false"
+        );
+        assert_eq!(
+            after, before,
+            "ccr_store must not grow when enable_ccr_marker=false"
+        );
+    }
+
+    #[test]
+    fn mixed_array_enable_ccr_marker_false_suppresses_marker_and_store() {
+        use crate::ccr::InMemoryCcrStore;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..200)
+            .map(|i| match i % 3 {
+                0 => json!(format!("s{i}")),
+                1 => json!(i),
+                _ => json!({"id": i, "status": "ok"}),
+            })
+            .collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("MixedArray stays an array");
+        assert!(arr.len() < items.len(), "drop should still happen");
+        assert!(
+            arr.iter().all(|v| !is_ccr_dropped_marker(v)),
+            "no marker should be present when enable_ccr_marker=false"
+        );
+        assert_eq!(
+            after, before,
+            "ccr_store must not grow when enable_ccr_marker=false"
+        );
+    }
+
+    #[test]
+    fn dict_array_enable_ccr_marker_false_suppresses_marker_and_store_via_process_value() {
+        use crate::ccr::InMemoryCcrStore;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force the lossy path
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..200).map(|_| json!({"status": "ok"})).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        let arr = out.as_array().expect("DictArray stays an array");
+        assert!(arr.len() < items.len(), "drop should still happen");
+        assert!(
+            arr.iter().all(|v| v.get("_ccr_dropped").is_none()),
+            "no sentinel should be present when enable_ccr_marker=false"
+        );
+        assert_eq!(
+            after, before,
+            "ccr_store must not grow when enable_ccr_marker=false"
+        );
+    }
+
+    #[test]
+    fn bool_array_enable_ccr_marker_false_still_unchanged() {
+        use crate::ccr::InMemoryCcrStore;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..200).map(|i| json!(i % 2 == 0)).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        assert_eq!(out, Value::Array(items));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn nested_array_enable_ccr_marker_false_still_unchanged() {
+        use crate::ccr::InMemoryCcrStore;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..200).map(|i| json!([i, i + 1])).collect();
+
+        let before = store.len();
+        let (out, _info) = c.process_value(&Value::Array(items.clone()), 0, "", 1.0);
+        let after = store.len();
+
+        assert_eq!(out, Value::Array(items));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn empty_array_enable_ccr_marker_false_still_unchanged() {
+        use crate::ccr::InMemoryCcrStore;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+
+        let before = store.len();
+        let (out, info) = c.process_value(&json!([]), 0, "", 1.0);
+        let after = store.len();
+
+        assert_eq!(out, json!([]));
+        assert!(info.is_empty());
+        assert_eq!(after, before);
     }
 }

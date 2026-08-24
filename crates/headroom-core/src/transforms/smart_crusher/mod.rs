@@ -61,7 +61,7 @@ pub use config::SmartCrusherConfig;
 pub use constraints::{
     default_oss_constraints, KeepErrorsConstraint, KeepStructuralOutliersConstraint,
 };
-pub use crusher::{CrushArrayResult, SmartCrusher};
+pub use crusher::{is_ccr_dropped_marker, CrushArrayResult, SmartCrusher};
 pub use crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
 pub use error_keywords::ERROR_KEYWORDS;
 pub use field_detect::{detect_id_field_statistically, detect_score_field_statistically};
