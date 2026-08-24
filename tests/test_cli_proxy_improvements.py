@@ -290,6 +290,85 @@ class TestKeyboardInterruptExitCode:
         assert result.exit_code == 130
 
 
+class TestNoOptimizeContract:
+    """Pin the documented `--no-optimize` contract: text compression only.
+
+    `--no-optimize` must disable `ProxyConfig.optimize` and nothing else.
+    `image_optimize` and `ccr_inject_tool` must keep their defaults. If a
+    future change widens `--no-optimize` to also gate those, this test
+    breaks instead of the docs silently going stale again.
+    """
+
+    def test_no_optimize_disables_only_text_compression(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(main, ["proxy", "--no-optimize"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        cfg = mock_run_server["config"]
+        assert cfg.optimize is False
+        # Unaffected by --no-optimize: each has its own opt-out flag.
+        assert cfg.image_optimize is True
+        assert cfg.ccr_inject_tool is True
+
+    def test_without_no_optimize_optimize_defaults_true(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        cfg = mock_run_server["config"]
+        assert cfg.optimize is True
+        assert cfg.image_optimize is True
+        assert cfg.ccr_inject_tool is True
+
+
+class TestNoImageOptimizeFlag:
+    """`--no-image-optimize` / HEADROOM_NO_IMAGE_OPTIMIZE disable image compression
+    independently of --no-optimize (text compression) and --no-ccr-inject-tool."""
+
+    def test_flag_disables_image_optimize(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(main, ["proxy", "--no-image-optimize"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        cfg = mock_run_server["config"]
+        assert cfg.image_optimize is False
+        # Independent of text compression and CCR.
+        assert cfg.optimize is True
+        assert cfg.ccr_inject_tool is True
+
+    def test_default_image_optimize_is_true(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].image_optimize is True
+
+    def test_env_var_disables_image_optimize(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_NO_IMAGE_OPTIMIZE": "1"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].image_optimize is False
+
+    def test_help_mentions_no_image_optimize(self, runner: CliRunner) -> None:
+        result = runner.invoke(main, ["proxy", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "--no-image-optimize" in result.output
+        assert "HEADROOM_NO_IMAGE_OPTIMIZE" in result.output
+
+    def test_help_no_optimize_states_text_compression_only(self, runner: CliRunner) -> None:
+        """--help text for --no-optimize must not claim full passthrough."""
+        result = runner.invoke(main, ["proxy", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "text compression" in result.output.lower()
+        assert "x-headroom-bypass" in result.output
+
+
 class TestNewEnvVarWiring:
     """Verify newly-added envvar= wiring works for options that lacked it."""
 

@@ -6,15 +6,50 @@
 
 ### Passthrough
 
-Headroom forwards requests without modification.
+Two different controls are involved here — they are not interchangeable, and
+`--no-optimize` alone does **not** give you passthrough. See the
+[transform control table](../content/docs/proxy.mdx#transform-controls) for
+the full list of transforms and what disables each one.
+
+#### `--no-optimize` (server-wide, text compression only)
+
+`headroom proxy --no-optimize` sets `ProxyConfig.optimize = False`, which
+disables **text compression only** (the Kompress / structural-compression
+gate). Every other transform keeps running under its own default:
+- Image compression (`image_optimize`, default on) — disable with
+  `--no-image-optimize` / `HEADROOM_NO_IMAGE_OPTIMIZE`
+- CCR tool injection (`ccr_inject_tool`, default on) — disable with
+  `--no-ccr-inject-tool`
+- Memory context/tool injection — controlled independently by whether a
+  memory handler is configured and `HEADROOM_MEMORY_INJECTION_MODE`, not by
+  `--no-optimize`
 
 **Behavior:**
-- All requests pass through unchanged
+- Text compression is skipped
+- Image compression, CCR tool injection, and memory injection still run
+  unless separately disabled
 - Response headers may be modified for telemetry
-- No compression applied
-- Useful for testing or debugging
 
 **Configuration:** `headroom proxy --no-optimize`
+
+#### `x-headroom-bypass: true` (per-request, full passthrough)
+
+For full passthrough of an individual request — no text compression, no
+image compression, no CCR injection, no memory injection — set the request
+header `x-headroom-bypass: true` (or `x-headroom-mode: passthrough`). This is
+the accurate "all requests pass through unchanged" control; `--no-optimize`
+is not.
+
+**Behavior:**
+- All transforms are skipped for that request
+- Response headers may be modified for telemetry
+- Useful for testing, debugging, or sub-agent calls that must not be mutated
+
+**Configuration:** send header `x-headroom-bypass: true` on the request
+
+**Caveat:** tool-array ordering under bypass is being hardened in a separate
+change; until that lands, treat bypass as "no compression / no injection"
+rather than a guarantee of byte-for-byte-identical request bytes.
 
 **Request Flow:**
 ```

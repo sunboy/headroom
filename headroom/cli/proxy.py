@@ -219,9 +219,33 @@ def dashboard(port: int, no_open: bool) -> None:
         "Off by default while this feature ships."
     ),
 )
-@click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
+@click.option(
+    "--no-optimize",
+    is_flag=True,
+    help=(
+        "Disable text compression only (sets ProxyConfig.optimize=False). Image "
+        "compression, CCR tool injection, and memory injection are UNAFFECTED and "
+        "keep running under their own controls (--no-image-optimize, "
+        "--no-ccr-inject-tool, --no-memory-context/--no-memory-tools). This is NOT "
+        "full passthrough. To skip compression, image optimization, CCR, and "
+        "memory injection for a single request, send the header "
+        "x-headroom-bypass: true (or x-headroom-mode: passthrough). Note that "
+        "bypass does not yet guarantee byte-identical request bytes -- tool "
+        "ordering still applies; see docs/content/docs/proxy.mdx."
+    ),
+)
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
+@click.option(
+    "--no-image-optimize",
+    is_flag=True,
+    envvar="HEADROOM_NO_IMAGE_OPTIMIZE",
+    help=(
+        "Disable image compression/token optimization. Independent of "
+        "--no-optimize, which only affects text compression. "
+        "Env: HEADROOM_NO_IMAGE_OPTIMIZE."
+    ),
+)
 @click.option(
     "--no-ccr-inject-tool",
     is_flag=True,
@@ -756,6 +780,7 @@ def proxy(
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
+    no_image_optimize: bool,
     no_ccr_inject_tool: bool,
     no_ccr_marker: bool,
     no_ccr_proactive_expansion: bool,
@@ -822,7 +847,14 @@ def proxy(
     Examples:
         headroom proxy                    Start proxy on port 8787
         headroom proxy --port 8080        Start proxy on port 8080
-        headroom proxy --no-optimize      Passthrough mode (no optimization)
+        headroom proxy --no-optimize      Disable text compression only (NOT full
+                                           passthrough — see below)
+
+    \b
+    For full passthrough of a single request (no compression, no image
+    optimization, no CCR, no memory injection), send the header
+    x-headroom-bypass: true (or x-headroom-mode: passthrough) instead of
+    relying on --no-optimize, which only turns off text compression.
 
     \b
     Usage with Claude Code:
@@ -950,7 +982,16 @@ def proxy(
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
         mode=effective_mode,
+        # NOTE: optimize (--no-optimize) and image_optimize (--no-image-optimize)
+        # are separate controls — text compression and image compression are
+        # independent transforms and each needs its own opt-out. Neither
+        # touches CCR tool injection (--no-ccr-inject-tool) or memory
+        # injection (--no-memory-context/--no-memory-tools). For a single
+        # request that must skip all of the above, use the
+        # x-headroom-bypass: true / x-headroom-mode: passthrough header
+        # instead of stacking flags.
         optimize=not no_optimize,
+        image_optimize=not no_image_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
