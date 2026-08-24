@@ -1417,7 +1417,14 @@ class AnthropicHandlerMixin:
                     # in analyze_query can never match. Fail-closed per
                     # `feedback_no_silent_fallbacks`.
                     if self.ccr_context_tracker and ccr_workspace_key:
-                        self._turn_counter += 1
+                        # Turn numbers are scoped per ccr_workspace_key inside
+                        # the tracker itself (see ContextTracker.next_turn_number)
+                        # rather than a process-global counter — two unrelated
+                        # workspaces served by the same proxy each get their
+                        # own independent turn sequence.
+                        turn_number = self.ccr_context_tracker.next_turn_number(
+                            ccr_workspace_key
+                        )
                         for hash_key in injector.detected_hashes:
                             # Get compression metadata from store
                             store = get_compression_store()
@@ -1425,7 +1432,7 @@ class AnthropicHandlerMixin:
                             if entry:
                                 self.ccr_context_tracker.track_compression(
                                     hash_key=hash_key,
-                                    turn_number=self._turn_counter,
+                                    turn_number=turn_number,
                                     tool_name=entry.get("tool_name"),
                                     original_count=entry.get("original_item_count", 0),
                                     compressed_count=entry.get("compressed_item_count", 0),
@@ -1464,7 +1471,7 @@ class AnthropicHandlerMixin:
                 if user_query:
                     recommendations = self.ccr_context_tracker.analyze_query(
                         user_query,
-                        self._turn_counter,
+                        self.ccr_context_tracker.current_turn_number(ccr_workspace_key),
                         workspace_key=ccr_workspace_key,
                     )
                     if recommendations:
