@@ -88,10 +88,30 @@ def _filler_messages(n: int = 2) -> list[dict[str, Any]]:
     return [{"role": "user", "content": f"step {i}: please continue the task"} for i in range(n)]
 
 
+def _openai_tool_call(call_id: str, name: str = "Bash") -> dict[str, Any]:
+    """Assistant message pairing a tool_call_id to a resolvable (non-excluded)
+    tool name, so tests exercise the error-protection rail on its own merits
+    rather than incidentally relying on the fail-closed unresolved-id path."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}],
+    }
+
+
+def _anthropic_tool_use(tool_use_id: str, name: str = "Bash") -> dict[str, Any]:
+    """Anthropic-format equivalent of ``_openai_tool_call``."""
+    return {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": tool_use_id, "name": name, "input": {}}],
+    }
+
+
 class TestErrorOutputProtection:
     def test_string_tool_message_with_error_protected(self, tokenizer: Tokenizer) -> None:
         router = ContentRouter()
         messages = _filler_messages() + [
+            _openai_tool_call("call_1"),
             {"role": "tool", "tool_call_id": "call_1", "content": _TRACEBACK},
             {"role": "user", "content": "what went wrong?"},
         ]
@@ -103,6 +123,7 @@ class TestErrorOutputProtection:
     def test_tool_result_block_with_is_error_flag_protected(self, tokenizer: Tokenizer) -> None:
         router = ContentRouter()
         messages = _filler_messages() + [
+            _anthropic_tool_use("toolu_1"),
             {
                 "role": "user",
                 "content": [
@@ -123,6 +144,7 @@ class TestErrorOutputProtection:
     def test_tool_result_block_with_error_indicators_protected(self, tokenizer: Tokenizer) -> None:
         router = ContentRouter()
         messages = _filler_messages() + [
+            _anthropic_tool_use("toolu_2"),
             {
                 "role": "user",
                 "content": [
@@ -172,6 +194,7 @@ class TestErrorOutputProtection:
         """The explicit `is_error` flag needs no indicator corroboration."""
         router = ContentRouter()
         messages = _filler_messages() + [
+            _anthropic_tool_use("toolu_4"),
             {
                 "role": "user",
                 "content": [
