@@ -1364,8 +1364,13 @@ class HeadroomProxy(
             else None
         )
 
-        # Turn counter for context tracking
-        self._turn_counter = 0
+        # Turn counters for CCR context tracking now live inside
+        # ContextTracker itself, keyed per ccr_workspace_key (see
+        # ContextTracker.next_turn_number) — not here. A single
+        # process-global counter would be shared across every
+        # conversation/workspace this proxy serves, making the
+        # recorded turn_number meaningless (it would reflect total
+        # proxy traffic, not any one conversation's turn).
 
         # Memory Handler (persistent user memory)
         self.memory_handler: MemoryHandler | None = None

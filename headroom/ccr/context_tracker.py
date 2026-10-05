@@ -122,6 +122,12 @@ class ContextTrackerConfig:
     # Maximum items to proactively expand per turn
     max_proactive_expansions: int = 2
 
+    # Maximum number of distinct turn-counter scopes (workspaces) to
+    # retain. LRU eviction, same pattern as max_tracked_contexts above.
+    # Bounds the per-scope turn counter dict on a long-running proxy
+    # that serves many distinct projects over its lifetime.
+    max_tracked_turn_scopes: int = 500
+
 
 class ContextTracker:
     """Tracks compressed contexts across conversation turns.
@@ -158,6 +164,60 @@ class ContextTracker:
         self._contexts: dict[str, CompressedContext] = {}
         self._turn_order: list[str] = []  # For LRU
         self._current_turn: int = 0
+
+        # Per-scope turn counters. Keyed by the CCR workspace key (the
+        # same identity that gates track_compression/analyze_query
+        # against the cross-project leak — see CompressedContext
+        # docstring above). A single ContextTracker is a process-wide
+        # object shared by every request the proxy serves; without
+        # this per-key map, "turn number" degenerates into a raw count
+        # of proxy traffic instead of a given conversation/workspace's
+        # own turn sequence. Bounded by LRU eviction (see
+        # ``next_turn_number``) so a long-running proxy that touches
+        # many distinct workspaces over its lifetime doesn't grow this
+        # dict without limit.
+        self._turn_counters: dict[str, int] = {}
+        self._turn_counter_order: list[str] = []  # LRU order, oldest first
+
+    def next_turn_number(self, scope_key: str) -> int:
+        """Advance and return the next turn number for ``scope_key``.
+
+        Each distinct ``scope_key`` (the CCR workspace key resolved by
+        the proxy for the current request) gets its own independent,
+        monotonically increasing turn sequence starting at 1. This
+        replaces the old ``HeadroomProxyServer._turn_counter``, a
+        single process-global integer incremented by every request the
+        proxy served regardless of which conversation/workspace it
+        belonged to — meaning the ``turn_number`` recorded against any
+        one conversation actually reflected total proxy traffic, not
+        that conversation's own turn.
+
+        LRU-bounded like ``_contexts``/``_turn_order`` above: once more
+        than ``config.max_tracked_turn_scopes`` distinct scopes have
+        been seen, the least-recently-touched scope's counter is
+        evicted. A scope that resumes after eviction simply restarts
+        numbering from 1 — turn_number is a human-readable label (see
+        ``_generate_reason``) with no correctness-critical downstream
+        use, so this is a safe trade for bounded memory.
+        """
+        if scope_key in self._turn_counter_order:
+            self._turn_counter_order.remove(scope_key)
+        self._turn_counter_order.append(scope_key)
+        self._turn_counters[scope_key] = self._turn_counters.get(scope_key, 0) + 1
+
+        while len(self._turn_counters) > self.config.max_tracked_turn_scopes:
+            oldest = self._turn_counter_order.pop(0)
+            del self._turn_counters[oldest]
+
+        return self._turn_counters[scope_key]
+
+    def current_turn_number(self, scope_key: str) -> int:
+        """Return the most recently issued turn number for ``scope_key``.
+
+        Does not advance the counter or touch LRU order. Returns 0 if
+        ``scope_key`` has never had a turn issued (or was evicted).
+        """
+        return self._turn_counters.get(scope_key, 0)
 
     def track_compression(
         self,
@@ -587,9 +647,11 @@ class ContextTracker:
         return {
             "tracked_contexts": len(self._contexts),
             "current_turn": self._current_turn,
+            "tracked_turn_scopes": len(self._turn_counters),
             "config": {
                 "enabled": self.config.enabled,
                 "max_contexts": self.config.max_tracked_contexts,
+                "max_turn_scopes": self.config.max_tracked_turn_scopes,
                 "relevance_threshold": self.config.relevance_threshold,
                 "proactive_expansion": self.config.proactive_expansion,
             },
@@ -609,6 +671,8 @@ class ContextTracker:
         self._contexts.clear()
         self._turn_order.clear()
         self._current_turn = 0
+        self._turn_counters.clear()
+        self._turn_counter_order.clear()
 
 
 # Process-wide singleton — kept only for the unit-test API surface.
